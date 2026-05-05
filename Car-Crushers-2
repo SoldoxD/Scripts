@@ -1,3 +1,13 @@
+--Anti AFK
+local vu = game:GetService("VirtualUser")
+game:GetService("Players").LocalPlayer.Idled:connect(function()
+   vu:Button2Down(Vector2.new(0,0),workspace.CurrentCamera.CFrame)
+   task.wait(1)
+   vu:Button2Up(Vector2.new(0,0),workspace.CurrentCamera.CFrame)
+end)
+
+
+
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService        = game:GetService("RunService")
@@ -17,6 +27,11 @@ local SaveCustoms      = rE:WaitForChild("SaveCustoms")
 local VehicleInformation = ReplicatedStorage:WaitForChild("VehicleInformation")
 local VehicleOrder       = require(ReplicatedStorage:WaitForChild("VehicleOrder"))
 
+local Event = game:GetService("ReplicatedStorage").rE.ChangeSetting
+Event:FireServer(
+    "Spawnpoint",
+    1
+)
 local function tryRequire(path)
     local ok, mod = pcall(require, path)
     if ok then return mod end
