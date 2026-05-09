@@ -95,7 +95,7 @@ local GuiLibrary do
     local src = game:HttpGet("https://raw.githubusercontent.com/SoldoxD/libery/refs/heads/main/main")
     GuiLibrary = loadstring(src)()
 end
-
+GuiLibrary.Icon = 105049082124083
 local State = {
     AutoFarm        = false,  
     AutoBuyPlatina  = false, 
