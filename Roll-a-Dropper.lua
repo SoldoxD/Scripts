@@ -85,7 +85,7 @@ pcall(function()
 end)
 
 -- ================= GUI =================
-
+GuiLibrary.Icon = 105049082124083
 local window  = GuiLibrary:CreateWindow("Build Ur Tycoon GUI - By cyber_modz", UDim2.new(0, 540, 0, 450))
 local mainTab = GuiLibrary:CreateTab(window, "Main")
 
