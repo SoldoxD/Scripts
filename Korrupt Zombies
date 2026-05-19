@@ -1,0 +1,2168 @@
+
+
+local GuiLibrary = loadstring(game:HttpGet("https://raw.githubusercontent.com/SoldoxD/libery/refs/heads/main/main"))()
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage= game:GetService("ReplicatedStorage")
+local Workspace        = game:GetService("Workspace")
+local HttpService      = game:GetService("HttpService")
+local Lighting         = game:GetService("Lighting")
+local VirtualUser      = game:GetService("VirtualUser")
+
+local LocalPlayer = Players.LocalPlayer
+local Mouse       = LocalPlayer:GetMouse()
+local Camera      = Workspace.CurrentCamera
+
+local Remote          = ReplicatedStorage.Remotes.RemoteEvent
+local RemoteFunction  = ReplicatedStorage.Remotes.RemoteFunction
+
+local ModuleHandler, Modules, SharedMemory
+pcall(function()
+    ModuleHandler = require(ReplicatedStorage.Modules.Shared.Helpers.ModuleHandler)
+    Modules = ModuleHandler.Modules
+    SharedMemory = ModuleHandler.SharedMemory
+end)
+
+local function getWeaponManager()
+    if Modules and Modules.WeaponManagerClient then return Modules.WeaponManagerClient end
+end
+
+local function getCurrentWeaponData()
+    if SharedMemory and SharedMemory.CurrentWeaponData then return SharedMemory.CurrentWeaponData end
+end
+
+local getnilinstances = getnilinstances or function() return {} end
+local getDebugId = function(obj)
+    if obj and obj.GetDebugId then
+        return obj:GetDebugId()
+    end
+    return nil
+end
+
+local Flags = {
+
+    SilentAim       = false,
+    SilentPart      = "Head",
+    SilentFOV       = 360,
+    SilentFOVShow   = false,
+    SilentFOVColor  = Color3.fromRGB(232, 65, 78),
+    HitChance       = 100,
+    VisibleCheck    = false,
+
+    Aimbot          = false,
+    AimbotMode      = "Memory",
+    AimbotPart      = "Head",
+    AimbotSmoothness= 0.20,
+    AimbotFOV       = 120,
+    AimbotRefresh   = 60,
+    AimbotPrediction= 0.165,
+    AimbotDistance  = 1000,
+    AimbotSticky    = false,
+    AimbotVisCheck  = false,
+    AimbotHeld      = true,
+    AimbotFOVShow   = false,
+    AimbotFOVColor  = Color3.fromRGB(85, 170, 255),
+
+    NoRecoil        = false,
+    NoSpread        = false,
+    NoSway          = false,
+    RapidFire       = false,
+    RapidFireRate   = 1200,
+    OneShotKill     = false,
+
+    KillAll         = false,
+    KillAllLoop     = false,
+    KillAllMethod   = "Flamethrower",
+    KillAllInterval = 1.0,
+    AutoBuyAmmo     = false,
+
+    AutoScrap       = false,
+    AutoRepair      = false,
+
+    AutoMysteryBox  = false,
+    DesiredWeapon   = "Any",
+
+    ESP             = false,
+    ESPBox          = true,
+    ESPName         = true,
+    ESPHealth       = true,
+    ESPDistance     = true,
+    ESPTracers      = false,
+    ESPColor        = Color3.fromRGB(232, 65, 78),
+    ESPMaxDistance  = 2000,
+
+    Chams           = false,
+    ChamsColor      = Color3.fromRGB(232, 65, 78),
+    FullBright      = false,
+
+    WalkSpeed       = 16,
+    JumpPower       = 50,
+    InfiniteJump    = false,
+    NoClip          = false,
+    Fly             = false,
+    FlySpeed        = 50,
+    HighFOV         = false,
+    FOVValue        = 90,
+
+    AntiAFK         = true,
+    AntiDown        = false,
+}
+
+local function getCharacter() return LocalPlayer.Character end
+local function getHumanoid()
+    local c = getCharacter()
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+local function getRoot()
+    local c = getCharacter()
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function isAlive(zombie)
+    if not zombie or not zombie.Parent then return false end
+    local hum = zombie:FindFirstChildOfClass("Humanoid")
+    if hum and hum.Health <= 0 then return false end
+    return zombie:FindFirstChild("HumanoidRootPart") ~= nil
+end
+
+local function getZombies()
+    local list = {}
+    local zfolder = Workspace:FindFirstChild("Zombies")
+    if zfolder then
+        for _, z in ipairs(zfolder:GetChildren()) do
+            if isAlive(z) then table.insert(list, z) end
+        end
+    end
+
+    for _, obj in ipairs(getnilinstances()) do
+        if obj.Name == "Zombie" and isAlive(obj) then
+            table.insert(list, obj)
+        end
+    end
+    return list
+end
+
+local function getZombieHead(zombie)
+    return zombie:FindFirstChild("Head")
+        or zombie:FindFirstChild("UpperTorso")
+        or zombie:FindFirstChild("HumanoidRootPart")
+end
+
+local function getZombiePart(zombie, partName)
+    return zombie:FindFirstChild(partName) or getZombieHead(zombie)
+end
+
+local function isVisible(part)
+    if not part then return false end
+    local origin = Camera.CFrame.Position
+    local dir = (part.Position - origin)
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = {
+        Camera, getCharacter(), Workspace:FindFirstChild("Players"),
+        Workspace:FindFirstChild("DebugRays"), Workspace:FindFirstChild("Ignore"),
+        Workspace:FindFirstChild("Downed")
+    }
+    local result = Workspace:Raycast(origin, dir, rayParams)
+    if not result then return true end
+    if result.Instance:IsDescendantOf(part.Parent) then return true end
+    return false
+end
+
+local function getSilentAimTarget()
+    local closestDist = math.huge
+    local bestPart = nil
+    local viewSize = Camera.ViewportSize
+    local center = Vector2.new(viewSize.X/2, viewSize.Y/2)
+
+    for _, zombie in ipairs(getZombies()) do
+        local part = getZombiePart(zombie, Flags.SilentPart)
+        if part then
+            local screen, onScreen = Camera:WorldToViewportPoint(part.Position)
+            if onScreen then
+                local dist = (Vector2.new(screen.X, screen.Y) - center).Magnitude
+                local fovOk = dist <= Flags.SilentFOV
+                local visOk = (not Flags.VisibleCheck) or isVisible(part)
+                if fovOk and visOk and dist < closestDist then
+                    closestDist = dist
+                    bestPart = part
+                end
+            end
+        end
+    end
+    return bestPart
+end
+
+local function predictPart(part)
+    if not part then return nil end
+    local ok, vel = pcall(function() return part.AssemblyLinearVelocity end)
+    if not ok or not vel then vel = Vector3.zero end
+    return part.Position + vel * Flags.AimbotPrediction
+end
+
+local function pickAimbotPart(zombie)
+
+    local order = {Flags.AimbotPart, "Head", "UpperTorso", "Torso", "LowerTorso", "HumanoidRootPart"}
+    local seen = {}
+    for _, n in ipairs(order) do
+        if not seen[n] then
+            seen[n] = true
+            local p = zombie:FindFirstChild(n)
+            if p then return p end
+        end
+    end
+    return nil
+end
+
+local function getAimbotTarget()
+    local mp = UserInputService:GetMouseLocation()
+    local camPos = Camera.CFrame.Position
+    local bestPart, bestDist = nil, math.huge
+    for _, zombie in ipairs(getZombies()) do
+        local hrp = zombie:FindFirstChild("HumanoidRootPart")
+        if hrp and (hrp.Position - camPos).Magnitude <= Flags.AimbotDistance then
+            local part = pickAimbotPart(zombie)
+            if part then
+                local visOk = (not Flags.AimbotVisCheck) or isVisible(part)
+                if visOk then
+                    local pred = predictPart(part)
+                    local sp, on = Camera:WorldToViewportPoint(pred)
+                    if on then
+                        local dx, dy = sp.X - mp.X, sp.Y - mp.Y
+                        local d = math.sqrt(dx*dx + dy*dy)
+                        if d <= Flags.AimbotFOV and d < bestDist then
+                            bestPart, bestDist = part, d
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return bestPart
+end
+
+local checkcaller = checkcaller or function() return false end
+local hookmeta    = hookmetamethod
+local hookfunc    = hookfunction or replaceclosure or detour
+
+local STI = setthreadidentity
+        or (syn and syn.set_thread_identity)
+        or set_thread_identity
+        or setidentity
+        or setthreadcontext
+local function elevate()
+    if STI then pcall(STI, 8) end
+end
+
+local CachedSilent = nil
+local CachedAimbot = nil
+
+local function refreshCaches()
+
+    local p = getSilentAimTarget()
+    if p and p.Parent then
+        local zombie = p.Parent
+        local head = getZombiePart(zombie, "Head") or p
+        local origin = Camera.CFrame.Position
+        CachedSilent = {
+            part   = p,
+            zombie = zombie,
+            head   = head,
+            pos    = p.Position,
+            lookV  = (p.Position - origin).Unit,
+        }
+    else
+        CachedSilent = nil
+    end
+
+    CachedAimbot = getAimbotTarget()
+end
+
+local function rewriteZombieHit(hitData, info_HitPart)
+    if type(hitData) ~= "table" then return end
+    local zh = hitData.ZombiesHit
+    if type(zh) ~= "table" or #zh < 3 then return end
+    for i = 1, #zh, 3 do
+        local zombie = zh[i]
+        local info   = zh[i + 2]
+        if typeof(zombie) == "Instance" then
+            local head = zombie.Head
+            if head then
+                zh[i + 1] = head
+                if type(info) == "table" then
+                    info.HitPart = info_HitPart or "Head"
+                end
+            end
+        end
+    end
+    hitData.Headshot = true
+end
+
+local function processOutgoing(action, args)
+    if action == "NewProjectiles" and Flags.SilentAim
+       and math.random(1, 100) <= Flags.HitChance then
+        local t = CachedSilent
+        if t then
+            local projectiles = args[2]
+            if type(projectiles) == "table" then
+                for i = 1, #projectiles do
+                    local proj = projectiles[i]
+                    if type(proj) == "table" then
+                        proj.HitPosition = t.pos
+                    end
+                end
+            end
+        end
+    end
+
+    if action == "ProjectileHit" then
+        local hitData = args[3]
+        if type(hitData) == "table" then
+            if Flags.SilentAim and math.random(1, 100) <= Flags.HitChance then
+                local t = CachedSilent
+                if t then
+                                        hitData.HitWall = nil
+                    hitData.Headshot = (Flags.SilentPart == "Head")
+                    hitData.ZombiesHit = {
+                        t.zombie, t.head,
+                        {
+                            HitPart       = Flags.SilentPart,
+                            FleshHitIndex = math.random(1, 4),
+                            HitOffset     = CFrame.new(),
+                            HitLookVector = t.lookV,
+                        }
+                    }
+                end
+            end
+
+            if Flags.OneShotKill then
+                rewriteZombieHit(hitData, "Head")
+                            end
+        end
+    end
+end
+
+local hookInstalled = false
+
+if hookmeta then
+    local oldNamecall
+    local ok, err = pcall(function()
+        oldNamecall = hookmeta(game, "__namecall", function(self, ...)
+            elevate()
+            local method = getnamecallmethod()
+            if not checkcaller() and self == Remote and method == "FireServer" then
+                local n = select("#", ...)
+                local args = {...}
+                local action = args[1]
+                processOutgoing(action, args)
+                return oldNamecall(self, table.unpack(args, 1, n))
+            end
+            return oldNamecall(self, ...)
+        end)
+    end)
+    if ok then
+        hookInstalled = true
+    else
+            end
+end
+
+if not hookInstalled and hookfunc then
+    local ok, err = pcall(function()
+        local oldFire
+        oldFire = hookfunc(Remote.FireServer, function(self, ...)
+            elevate()
+            if not checkcaller() and self == Remote then
+                local n = select("#", ...)
+                local args = {...}
+                local action = args[1]
+                processOutgoing(action, args)
+                return oldFire(self, table.unpack(args, 1, n))
+            end
+            return oldFire(self, ...)
+        end)
+    end)
+    if ok then hookInstalled = true
+    else  end
+end
+
+if not hookInstalled then
+    end
+
+local DrawingOK, Drawing = pcall(function() return Drawing end)
+
+local ESPHolder = Instance.new("Folder")
+ESPHolder.Name = "KorruptESP"
+ESPHolder.Parent = game:GetService("CoreGui")
+
+local espObjects = {}
+
+local tracerLines = {}
+local function clearTracer(zombie)
+    if tracerLines[zombie] then
+        pcall(function() tracerLines[zombie]:Remove() end)
+        tracerLines[zombie] = nil
+    end
+end
+
+local function removeESP(zombie)
+    if espObjects[zombie] then
+        for _, obj in pairs(espObjects[zombie]) do
+            pcall(function() obj:Destroy() end)
+        end
+        espObjects[zombie] = nil
+    end
+    clearTracer(zombie)
+end
+
+local function createESP(zombie)
+    if espObjects[zombie] then return end
+    local head = getZombiePart(zombie, "Head")
+    local root = zombie:FindFirstChild("HumanoidRootPart")
+    if not head or not root then return end
+
+    local objs = {}
+
+    local bb = Instance.new("BillboardGui")
+    bb.Name = "ZombieESP"
+    bb.Adornee = head
+    bb.AlwaysOnTop = true
+    bb.Size = UDim2.new(0, 200, 0, 60)
+    bb.StudsOffset = Vector3.new(0, 2.5, 0)
+    bb.Parent = ESPHolder
+
+    local nameLbl = Instance.new("TextLabel")
+    nameLbl.Name = "NameLabel"
+    nameLbl.BackgroundTransparency = 1
+    nameLbl.Size = UDim2.new(1, 0, 0, 18)
+    nameLbl.Position = UDim2.new(0, 0, 0, 0)
+    nameLbl.Font = Enum.Font.GothamBold
+    nameLbl.TextSize = 14
+    nameLbl.TextColor3 = Flags.ESPColor
+    nameLbl.TextStrokeTransparency = 0.4
+    nameLbl.Text = zombie.Name or "Zombie"
+    nameLbl.Parent = bb
+
+    local healthLbl = Instance.new("TextLabel")
+    healthLbl.Name = "HealthLabel"
+    healthLbl.BackgroundTransparency = 1
+    healthLbl.Size = UDim2.new(1, 0, 0, 16)
+    healthLbl.Position = UDim2.new(0, 0, 0, 18)
+    healthLbl.Font = Enum.Font.Gotham
+    healthLbl.TextSize = 12
+    healthLbl.TextColor3 = Color3.fromRGB(120, 255, 120)
+    healthLbl.TextStrokeTransparency = 0.4
+    healthLbl.Text = ""
+    healthLbl.Parent = bb
+
+    local distLbl = Instance.new("TextLabel")
+    distLbl.Name = "DistanceLabel"
+    distLbl.BackgroundTransparency = 1
+    distLbl.Size = UDim2.new(1, 0, 0, 14)
+    distLbl.Position = UDim2.new(0, 0, 0, 34)
+    distLbl.Font = Enum.Font.Gotham
+    distLbl.TextSize = 11
+    distLbl.TextColor3 = Color3.fromRGB(220, 220, 220)
+    distLbl.TextStrokeTransparency = 0.4
+    distLbl.Text = ""
+    distLbl.Parent = bb
+
+    objs.Gui = bb
+    objs.NameLbl = nameLbl
+    objs.HealthLbl = healthLbl
+    objs.DistLbl = distLbl
+
+    local hl = Instance.new("Highlight")
+    hl.Name = "ZombieHL"
+    hl.Adornee = zombie
+    hl.FillTransparency = 1
+    hl.OutlineTransparency = 0
+    hl.OutlineColor = Flags.ESPColor
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.Parent = ESPHolder
+    objs.Highlight = hl
+
+    espObjects[zombie] = objs
+end
+
+local function updateESP()
+
+    for zombie, _ in pairs(espObjects) do
+        if not isAlive(zombie) then
+            removeESP(zombie)
+        end
+    end
+
+    if not Flags.ESP then
+        for zombie, _ in pairs(espObjects) do removeESP(zombie) end
+        return
+    end
+
+    local zombies = getZombies()
+    for _, zombie in ipairs(zombies) do
+        if not espObjects[zombie] then
+            createESP(zombie)
+        end
+    end
+
+    for zombie, objs in pairs(espObjects) do
+        local root = zombie:FindFirstChild("HumanoidRootPart")
+        local hum  = zombie:FindFirstChildOfClass("Humanoid")
+        if root and hum then
+            local dist = (Camera.CFrame.Position - root.Position).Magnitude
+
+            local show = dist <= Flags.ESPMaxDistance
+
+            objs.NameLbl.Visible = show and Flags.ESPName
+            objs.NameLbl.TextColor3 = Flags.ESPColor
+
+            if show and Flags.ESPHealth then
+                objs.HealthLbl.Visible = true
+                objs.HealthLbl.Text = ("HP: %d / %d"):format(math.floor(hum.Health), math.floor(hum.MaxHealth))
+
+                local pct = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+                objs.HealthLbl.TextColor3 = Color3.fromRGB(
+                    math.floor((1-pct)*255),
+                    math.floor(pct*220),
+                    60
+                )
+            else
+                objs.HealthLbl.Visible = false
+            end
+
+            if show and Flags.ESPDistance then
+                objs.DistLbl.Visible = true
+                objs.DistLbl.Text = ("[%d studs]"):format(math.floor(dist))
+            else
+                objs.DistLbl.Visible = false
+            end
+
+            objs.Gui.Enabled = show and (Flags.ESPName or Flags.ESPHealth or Flags.ESPDistance)
+
+            if Flags.ESPBox then
+                objs.Highlight.Enabled = show
+                objs.Highlight.OutlineColor = Flags.ESPColor
+                if Flags.Chams then
+                    objs.Highlight.FillTransparency = 0.5
+                    objs.Highlight.FillColor = Flags.ChamsColor
+                else
+                    objs.Highlight.FillTransparency = 1
+                end
+            else
+                objs.Highlight.Enabled = false
+            end
+
+            if Flags.ESPTracers and show then
+                local screenPos, onScreen = Camera:WorldToViewportPoint(root.Position)
+                if onScreen and DrawingOK and Drawing and Drawing.new then
+                    local line = tracerLines[zombie]
+                    if not line then
+                        line = Drawing.new("Line")
+                        line.Thickness = 1
+                        line.Transparency = 1
+                        tracerLines[zombie] = line
+                    end
+                    local vp = Camera.ViewportSize
+                    line.From = Vector2.new(vp.X/2, vp.Y)
+                    line.To   = Vector2.new(screenPos.X, screenPos.Y)
+                    line.Color   = Flags.ESPColor
+                    line.Visible = true
+                else
+                    clearTracer(zombie)
+                end
+            else
+                clearTracer(zombie)
+            end
+        end
+    end
+end
+
+local origMultipliers = {}
+local function applyCombatMods()
+    local wd = getCurrentWeaponData()
+    if not wd or not wd.WeaponMultipliers then return end
+    local wn = wd.WeaponName
+
+    if not origMultipliers[wn] then
+        origMultipliers[wn] = {}
+        for k, v in pairs(wd.WeaponMultipliers) do
+            origMultipliers[wn][k] = v
+        end
+    end
+
+    local orig = origMultipliers[wn]
+
+    if Flags.NoRecoil then
+        wd.WeaponMultipliers.Recoil = 0
+    else
+        wd.WeaponMultipliers.Recoil = orig.Recoil or wd.WeaponMultipliers.Recoil
+    end
+
+    if Flags.NoSpread then
+        wd.WeaponMultipliers["Hipfire Spread"] = 0
+        local wm = getWeaponManager()
+        if wm then
+            wm.TotalSpread = 0
+            wm.Spread = 0
+            if wm.SpreadPosition and wm.SpreadPosition.Position then
+                wm.SpreadPosition.Position = Vector3.new(0,0,0)
+                wm.SpreadPosition.Target = Vector3.new(0,0,0)
+            end
+        end
+    else
+        wd.WeaponMultipliers["Hipfire Spread"] = orig["Hipfire Spread"] or wd.WeaponMultipliers["Hipfire Spread"]
+    end
+
+    if Flags.RapidFire then
+        wd.WeaponMultipliers["Fire Rate"] = Flags.RapidFireRate
+    else
+        wd.WeaponMultipliers["Fire Rate"] = orig["Fire Rate"] or wd.WeaponMultipliers["Fire Rate"]
+    end
+
+    local wm = getWeaponManager()
+    if wm and Flags.NoRecoil then
+        wm.RecoilPosition = Vector3.new()
+        wm.RecoilRotation = Vector3.new()
+        if wm.GunRecoilRotation and wm.GunRecoilRotation.Position then
+            wm.GunRecoilRotation.Position = Vector3.new()
+            wm.GunRecoilRotation.Target   = Vector3.new()
+        end
+        if wm.GunRecoilPosition and wm.GunRecoilPosition.Position then
+            wm.GunRecoilPosition.Position = Vector3.new()
+            wm.GunRecoilPosition.Target   = Vector3.new()
+        end
+        if wm.GunPunchCameraRotationX then wm.GunPunchCameraRotationX.Position = 0; wm.GunPunchCameraRotationX.Target = 0 end
+        if wm.GunPunchCameraRotationY then wm.GunPunchCameraRotationY.Position = 0; wm.GunPunchCameraRotationY.Target = 0 end
+        if wm.GunPunchCameraRotationZ then wm.GunPunchCameraRotationZ.Position = 0; wm.GunPunchCameraRotationZ.Target = 0 end
+    end
+
+    if wm and Flags.NoSway then
+        if wm.MouseSwayRotation and wm.MouseSwayRotation.Position then
+            wm.MouseSwayRotation.Position = Vector3.new()
+            wm.MouseSwayRotation.Target   = Vector3.new()
+        end
+    end
+end
+
+local AimCurrentTarget = nil
+local AimLastTick = 0
+local mousemoverel = mousemoverel
+
+local function aimAtPart(part)
+    if not (part and part.Parent) then return end
+    local target = predictPart(part)
+    local sm = math.clamp(1 - Flags.AimbotSmoothness, 0.02, 1)
+    if Flags.AimbotMode == "Mouse" and mousemoverel then
+        local sp = Camera:WorldToViewportPoint(target)
+        local mp = UserInputService:GetMouseLocation()
+        mousemoverel((sp.X - mp.X) * sm, (sp.Y - mp.Y) * sm)
+    else
+        local cur = Camera.CFrame
+        Camera.CFrame = cur:Lerp(CFrame.new(cur.Position, target), sm)
+    end
+end
+
+local function runAimbot()
+    if not Flags.Aimbot then
+        AimCurrentTarget = nil
+        return
+    end
+    local now = tick()
+    local rate = math.max(Flags.AimbotRefresh, 1)
+    if now - AimLastTick < 1 / rate then return end
+    AimLastTick = now
+
+    local target
+    if Flags.AimbotSticky and AimCurrentTarget and AimCurrentTarget.Parent then
+        target = AimCurrentTarget
+    else
+        target = getAimbotTarget()
+        AimCurrentTarget = target
+    end
+    if target then aimAtPart(target) end
+end
+
+local SilentFOVCircle, AimbotFOVCircle
+if DrawingOK and Drawing and Drawing.new then
+    SilentFOVCircle = Drawing.new("Circle")
+    SilentFOVCircle.Visible     = false
+    SilentFOVCircle.Thickness   = 1
+    SilentFOVCircle.NumSides    = 64
+    SilentFOVCircle.Radius      = 360
+    SilentFOVCircle.Filled      = false
+    SilentFOVCircle.Transparency= 1
+    SilentFOVCircle.Color       = Flags.SilentFOVColor
+
+    AimbotFOVCircle = Drawing.new("Circle")
+    AimbotFOVCircle.Visible     = false
+    AimbotFOVCircle.Thickness   = 1
+    AimbotFOVCircle.NumSides    = 64
+    AimbotFOVCircle.Radius      = 120
+    AimbotFOVCircle.Filled      = false
+    AimbotFOVCircle.Transparency= 1
+    AimbotFOVCircle.Color       = Flags.AimbotFOVColor
+end
+
+local function updateFOVCircles()
+    local vp = Camera.ViewportSize
+    local center = Vector2.new(vp.X/2, vp.Y/2)
+    if SilentFOVCircle then
+        SilentFOVCircle.Visible  = Flags.SilentFOVShow
+        SilentFOVCircle.Position = center
+        SilentFOVCircle.Radius   = Flags.SilentFOV
+        SilentFOVCircle.Color    = Flags.SilentFOVColor
+    end
+    if AimbotFOVCircle then
+        AimbotFOVCircle.Visible  = Flags.AimbotFOVShow
+        AimbotFOVCircle.Position = center
+        AimbotFOVCircle.Radius   = Flags.AimbotFOV
+        AimbotFOVCircle.Color    = Flags.AimbotFOVColor
+    end
+end
+
+local function hasAmmo()
+    local wd = getCurrentWeaponData()
+    if not wd or not wd.SlotData then return false end
+    local sd = wd.SlotData
+    local a = (sd.Ammo or 0) + (sd.LeftAmmo or 0) + (sd.RightAmmo or 0) + (sd.TotalAmmo or 0)
+    return a > 0
+end
+
+local function consumeLocalAmmo(n)
+    if not (SharedMemory and SharedMemory.CurrentWeaponData) then return end
+    local wd = SharedMemory.CurrentWeaponData
+    local sd = wd.SlotData
+    if not sd then return end
+    n = math.max(n or 1, 1)
+    local function drain(field)
+        if sd[field] ~= nil then
+            local cur = sd[field]
+            local take = math.min(cur, n)
+            sd[field] = cur - take
+            n = n - take
+        end
+    end
+    drain("Ammo")
+    if n > 0 then drain("LeftAmmo") end
+    if n > 0 then drain("RightAmmo") end
+    if n > 0 then drain("TotalAmmo") end
+    local wm = getWeaponManager()
+    if wm and wm.UpdateAmmoUI then
+        pcall(function() wm:UpdateAmmoUI(sd) end)
+    end
+end
+
+local function buildNewProjectile(wd, head, bulletID, shootingID)
+    local sd = wd.SlotData or {}
+    local barrel
+    pcall(function()
+        barrel = wd.Weapon and wd.Weapon:FindFirstChild("ReferenceObjects") and wd.Weapon.ReferenceObjects:FindFirstChild("FirePart")
+    end)
+    return {
+        ZombiePenetration = 999,
+        Origin = Camera,
+        WeaponName = wd.WeaponName,
+        PackLevel = sd.PackLevel or 0,
+        BulletID = bulletID,
+        Attachments = sd.Attachments or {
+            Muzzle="None", Optic="None", Stock="None",
+            Underbarrel="None", Handle="None", Magazine="None", Laser="None"
+        },
+        HitPosition = head.Position,
+        OwnerID = LocalPlayer.UserId,
+        BarrelOrigin = barrel or Camera,
+        Tier = sd.Tier or 1,
+        ShootingID = shootingID,
+        AmmoMod = sd.AmmoMod,
+    }
+end
+
+local function killAllFlamethrower()
+    local wd = getCurrentWeaponData()
+    if not wd or not wd.WeaponName then return false, "no weapon" end
+    local zombies = getZombies()
+    if #zombies == 0 then return false, "no zombies" end
+
+    local first = getZombiePart(zombies[1], "Head")
+    if not first then return false, "no head" end
+
+    local bulletID = HttpService:GenerateGUID(false)
+    local shootingID = LocalPlayer.UserId .. "-" .. HttpService:GenerateGUID(false)
+    local proj = buildNewProjectile(wd, first, bulletID, shootingID)
+
+    local zh = {}
+    for _, zombie in ipairs(zombies) do
+        local head = getZombiePart(zombie, "Head")
+        if head then
+            table.insert(zh, zombie)
+            table.insert(zh, head)
+            table.insert(zh, {
+                HitPart       = "Head",
+                FleshHitIndex = 1,
+                HitOffset     = CFrame.new(),
+                HitLookVector = (head.Position - Camera.CFrame.Position).Unit,
+            })
+        end
+    end
+
+    pcall(function()
+        Remote:FireServer("NewProjectiles", {proj}, {
+            Ammo = 999, TakeFromReserve = false, Aiming = true
+        })
+        task.wait()
+        Remote:FireServer("ProjectileHit", bulletID, {
+            Headshot = true,
+            ZombiesHit = zh,
+        })
+    end)
+    consumeLocalAmmo(1)
+    return true, ("hit %d zombies (1 bullet)"):format(#zombies)
+end
+
+local function killAllWeapon()
+    local wd = getCurrentWeaponData()
+    if not wd or not wd.WeaponName then return false, "no weapon" end
+
+    local count = 0
+    for _, zombie in ipairs(getZombies()) do
+        local head = getZombiePart(zombie, "Head")
+        if head then
+            local bulletID = HttpService:GenerateGUID(false)
+            local shootingID = LocalPlayer.UserId .. "-" .. HttpService:GenerateGUID(false)
+            local proj = buildNewProjectile(wd, head, bulletID, shootingID)
+            pcall(function()
+                Remote:FireServer("NewProjectiles", {proj}, {
+                    Ammo = 999, TakeFromReserve = false, Aiming = true
+                })
+                task.wait()
+                Remote:FireServer("ProjectileHit", bulletID, {
+                    Headshot = true,
+                    ZombiesHit = {
+                        zombie, head,
+                        {
+                            HitPart = "Head", FleshHitIndex = 1,
+                            HitOffset = CFrame.new(),
+                            HitLookVector = (head.Position - Camera.CFrame.Position).Unit,
+                        }
+                    }
+                })
+            end)
+            count = count + 1
+        end
+    end
+    consumeLocalAmmo(count)
+    return true, ("hit %d zombies (%d bullets)"):format(count, count)
+end
+
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local function tapV()
+    if keypress and keyrelease then
+        pcall(function()
+            keypress(0x56)
+            task.wait(0.05)
+            keyrelease(0x56)
+        end)
+    else
+        pcall(function()
+            VirtualInputManager:SendKeyEvent(true,  Enum.KeyCode.V, false, game)
+            task.wait(0.05)
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.V, false, game)
+        end)
+    end
+end
+
+local function killAllMelee()
+    local zombies = getZombies()
+    if #zombies == 0 then return false, "no zombies" end
+    local root = getRoot()
+    if not root then return false, "no character" end
+
+    local originalCF = root.CFrame
+    local count = 0
+    for _, zombie in ipairs(zombies) do
+        local zr = zombie:FindFirstChild("HumanoidRootPart")
+        if zr then
+            pcall(function()
+                root.CFrame = zr.CFrame * CFrame.new(0, 0, 2)
+            end)
+            tapV()
+            count = count + 1
+            task.wait(0.05)
+        end
+    end
+    pcall(function() root.CFrame = originalCF end)
+    return true, ("melee on %d zombies"):format(count)
+end
+
+local function killAll()
+    if Flags.KillAllMethod == "Weapon" then
+        return killAllWeapon()
+    elseif Flags.KillAllMethod == "Melee" then
+        return killAllMelee()
+    end
+    return killAllFlamethrower()
+end
+
+local function pickAmmoBoxTarget()
+    local mf = Workspace:FindFirstChild("MapFolder")
+    local boxes = mf and mf:FindFirstChild("Ammo Boxes")
+    if not boxes then return nil end
+    local children = boxes:GetChildren()
+
+    for i = #children, 1, -1 do
+        local box = children[i]
+        local model = box:FindFirstChild("Model")
+        if model then
+            local mesh = model:FindFirstChild("Meshes/Ammo_low_Crate_low")
+            if mesh then return mesh end
+        end
+    end
+
+    for _, box in ipairs(children) do
+        local part = box:FindFirstChildWhichIsA("BasePart", true)
+        if part then return part end
+    end
+    return children[1]
+end
+
+local function getAmmoBox()
+    local mf = Workspace:FindFirstChild("MapFolder")
+    local boxes = mf and mf:FindFirstChild("Ammo Boxes")
+    if not boxes then return nil end
+    return boxes:FindFirstChild("Default") or boxes:GetChildren()[1]
+end
+
+local function getAmmoCost()
+    local wd = getCurrentWeaponData()
+    if not (wd and wd.SlotData) then return nil end
+    local sd = wd.SlotData
+    local info = Modules and Modules.WeaponInfo and Modules.WeaponInfo[wd.WeaponName or sd.Weapon]
+    local prices = Modules and Modules.AmmoPrices
+    if not (info and prices) then return nil end
+    local lvl = sd.PackLevel or 0
+    if info.WonderWeapon and lvl == 0 then
+        return prices.WonderWeaponPack0
+    end
+    return prices["Pack" .. tostring(lvl)]
+end
+
+local function getPlayerPoints()
+    local ok, v = pcall(function() return LocalPlayer.PlayerStats.Points.Value end)
+    if ok then return v end
+    return 0
+end
+
+local function isReloading()
+    if not SharedMemory then return false end
+    return SharedMemory.Reloading
+        or SharedMemory.ReloadingLeft
+        or SharedMemory.ReloadingRight
+        or false
+end
+
+local function buyAmmo()
+    local box = getAmmoBox()
+    if not box then return false, "no ammo box found" end
+
+    if isReloading() then
+        return false, "currently reloading"
+    end
+
+    local cost = getAmmoCost()
+    if cost then
+        local points = getPlayerPoints()
+        if points < cost then
+            return false, ("need %d points, have %d"):format(cost, points)
+        end
+    end
+
+    local root = getRoot()
+    if not root then return false, "no character" end
+    local home = root.CFrame
+
+    local part = box:FindFirstChildWhichIsA("BasePart", true)
+    if part then
+        pcall(function() root.CFrame = part.CFrame + Vector3.new(0, 3, 0) end)
+        task.wait(0.25)
+    end
+    local ok = pcall(function()
+        Remote:FireServer("Buy Ammo", box)
+    end)
+    task.wait(0.2)
+    pcall(function() root.CFrame = home end)
+    return ok, ok and ("bought (cost %s)"):format(cost or "?") or "buy failed"
+end
+
+local function listDamagedBarricades()
+    local mf = Workspace:FindFirstChild("MapFolder")
+    local folder = mf and mf:FindFirstChild("Barricades")
+    if not folder then return {} end
+    local out = {}
+    for _, b in ipairs(folder:GetChildren()) do
+        local stage = b:FindFirstChild("Stage")
+        local total = b:FindFirstChild("TotalPlanks")
+        if stage and total and stage.Value <= total.Value then
+            table.insert(out, b)
+        end
+    end
+    return out
+end
+
+local function repairOneBarricade(barricade)
+    local stage = barricade:FindFirstChild("Stage")
+    local total = barricade:FindFirstChild("TotalPlanks")
+    if not (stage and total) then return 0 end
+
+    local root = getRoot()
+    if not root then return 0 end
+    local home = root.CFrame
+
+    local part = barricade:FindFirstChild("Origin")
+        or barricade.PrimaryPart
+        or barricade:FindFirstChildWhichIsA("BasePart", true)
+    if not part or not part:IsA("BasePart") then return 0 end
+
+    pcall(function() root.CFrame = part.CFrame + Vector3.new(0, 3, 0) end)
+    task.wait(0.25)
+
+    local planks = 0
+    local safety = 0
+    while stage.Value <= total.Value and safety < 20 do
+        safety = safety + 1
+
+        local waitT = tick()
+        while barricade:GetAttribute("CannotRepair") and tick() - waitT < 1.5 do
+            task.wait(0.1)
+        end
+
+        pcall(function() root.CFrame = part.CFrame + Vector3.new(0, 3, 0) end)
+        local before = stage.Value
+        pcall(function() Remote:FireServer("Repair Barricade", barricade) end)
+
+        task.wait(0.4)
+        if stage.Value > before then
+            planks = planks + 1
+        end
+    end
+
+    pcall(function() root.CFrame = home end)
+    return planks
+end
+
+local function repairAllBarricades()
+    local gs = getGameStats()
+    if gs and gs:FindFirstChild("Paused") and gs.Paused.Value then
+        return false, "game paused"
+    end
+    local list = listDamagedBarricades()
+    if #list == 0 then return true, "no damaged barricades" end
+
+    local total = 0
+    for _, b in ipairs(list) do
+        total = total + repairOneBarricade(b)
+    end
+    return true, ("placed %d plank(s)"):format(total)
+end
+
+task.spawn(function()
+    while true do
+        task.wait(2.0)
+        if Flags.AutoRepair then
+            pcall(function()
+                local list = listDamagedBarricades()
+                if #list > 0 then
+                    repairAllBarricades()
+                end
+            end)
+        end
+    end
+end)
+
+local function listClosedDoors()
+    local mf = Workspace:FindFirstChild("MapFolder")
+    local doors = mf and mf:FindFirstChild("Doors")
+    if not doors then return {} end
+    local out = {}
+    for _, d in ipairs(doors:GetChildren()) do
+        if not d:GetAttribute("Open") then
+            table.insert(out, d)
+        end
+    end
+    return out
+end
+
+local function buyAllDoors()
+    local closed = listClosedDoors()
+    if #closed == 0 then return true, "all doors already open" end
+    local root = getRoot()
+    if not root then return false, "no character" end
+    local home = root.CFrame
+
+    local bought = 0
+    for _, door in ipairs(closed) do
+        if not door:GetAttribute("Open") then
+            local part = door:FindFirstChild("Interaction")
+                or door:FindFirstChild("Origin")
+                or door:FindFirstChildWhichIsA("BasePart", true)
+            if part and part:IsA("BasePart") then
+                pcall(function() root.CFrame = part.CFrame + Vector3.new(0, 3, 0) end)
+                task.wait(0.3)
+                pcall(function() Remote:FireServer("Buy Door", door) end)
+                bought = bought + 1
+                task.wait(0.4)
+            end
+        end
+    end
+    pcall(function() root.CFrame = home end)
+    return true, ("opened %d door(s)"):format(bought)
+end
+
+local function getPackAPunchBox()
+    local mf = Workspace:FindFirstChild("MapFolder")
+    local folder = mf and mf:FindFirstChild("Pack A Punch")
+    if not folder then return nil end
+    return folder:FindFirstChild("Default") or folder:GetChildren()[1]
+end
+
+local function canPackCurrentWeapon()
+    local wd = getCurrentWeaponData()
+    if not (wd and wd.SlotData) then return false, "no weapon equipped" end
+    local sd = wd.SlotData
+    if not sd.Weapon then return false, "no slot data" end
+    local info = Modules and Modules.WeaponInfo and Modules.WeaponInfo[sd.Weapon]
+    if not (info and info.PackedClipSize) then return false, "weapon can't be packed" end
+    local lvl = sd.PackLevel or 0
+    if lvl >= 3 then return false, "already max pack level" end
+    return true
+end
+
+local PACK_COSTS = { 5000, 15000, 30000 }
+
+local packBusy = false
+local function autoPackAPunch()
+    if packBusy then return false, "already running" end
+    packBusy = true
+    local function finish(ok, msg, kind)
+        packBusy = false
+        GuiLibrary:CreateNotification("Pack-A-Punch", msg, 3, kind or (ok and "success" or "error"))
+        return ok, msg
+    end
+
+    if not isPowerOn() then return finish(false, "power is off", "warning") end
+    local canPack, why = canPackCurrentWeapon()
+    if not canPack then return finish(false, why, "warning") end
+
+    local box = getPackAPunchBox()
+    if not box then return finish(false, "no PAP box found", "error") end
+
+    local inUse = box:GetAttribute("InUse")
+    if inUse and inUse ~= LocalPlayer.UserId then
+        return finish(false, "PAP busy with another player", "warning")
+    end
+    if box:GetAttribute("Disabled") then
+        return finish(false, "PAP on cooldown", "warning")
+    end
+
+    local wd = getCurrentWeaponData()
+    local sd = wd and wd.SlotData
+    local lvl = (sd and sd.PackLevel) or 0
+    local cost = PACK_COSTS[lvl + 1] or 5000
+    if box:GetAttribute("BonfireSale") then cost = math.floor(cost / 5) end
+    local points = 0
+    pcall(function() points = LocalPlayer.PlayerStats.Points.Value end)
+    if points < cost then
+        return finish(false, ("need %d points, have %d"):format(cost, points), "warning")
+    end
+
+    local root = getRoot()
+    if not root then return finish(false, "no character", "error") end
+    local home = root.CFrame
+    local boxPart = box:FindFirstChild("Interaction")
+        or box:FindFirstChild("Default")
+        or box:FindFirstChildWhichIsA("BasePart", true)
+    if not boxPart or not boxPart:IsA("BasePart") then
+        return finish(false, "no PAP part to TP to", "error")
+    end
+
+    local function tpToBox()
+        pcall(function() root.CFrame = boxPart.CFrame + Vector3.new(0, 3, 0) end)
+    end
+
+    if inUse == LocalPlayer.UserId and box:GetAttribute("Weapon") then
+        tpToBox(); task.wait(0.3)
+        pcall(function() Remote:FireServer("Take Packed Weapon", box) end)
+        task.wait(0.5)
+        pcall(function() root.CFrame = home end)
+        return finish(true, "took: " .. tostring(box:GetAttribute("Weapon")), "success")
+    end
+
+    tpToBox()
+    task.wait(0.3)
+    GuiLibrary:CreateNotification("Pack-A-Punch",
+        ("Inserting %s (cost %d)..."):format(sd.Weapon or "?", cost), 2, "info")
+    pcall(function() Remote:FireServer("Pack A Punch Weapon", box) end)
+
+    local startT = tick()
+    local lastTp = tick()
+    while tick() - startT < 25 do
+        if tick() - lastTp > 1.0 then
+            tpToBox()
+            lastTp = tick()
+        end
+        task.wait(0.3)
+        if box:GetAttribute("InUse") == LocalPlayer.UserId and box:GetAttribute("Weapon") then
+
+            task.wait(0.4)
+            tpToBox()
+            task.wait(0.3)
+            pcall(function() Remote:FireServer("Take Packed Weapon", box) end)
+            task.wait(0.6)
+            local got = tostring(box:GetAttribute("Weapon") or sd.Weapon or "?")
+            pcall(function() root.CFrame = home end)
+            return finish(true, "took: " .. got, "success")
+        end
+    end
+
+    pcall(function() root.CFrame = home end)
+    return finish(false, "timed out waiting for upgrade", "warning")
+end
+
+local function scrapTargets()
+    local out = {}
+    local items = Workspace:FindFirstChild("Ignore") and Workspace.Ignore:FindFirstChild("Items")
+    if items then
+        for _, it in ipairs(items:GetChildren()) do
+            if (it.Name == "Scrap" or it.Name == "Premium Scrap")
+               and not it:GetAttribute("PickingUp") then
+                table.insert(out, it)
+            end
+        end
+    end
+
+    for _, obj in ipairs(getnilinstances()) do
+        if (obj.Name == "Scrap" or obj.Name == "Premium Scrap")
+           and not obj:GetAttribute("PickingUp") then
+            table.insert(out, obj)
+        end
+    end
+    return out
+end
+
+local function autoPickupScrapTick()
+    if not Flags.AutoScrap then return end
+    local root = getRoot()
+    if not root then return end
+    local home = root.CFrame
+
+    local items = scrapTargets()
+    if #items == 0 then return end
+
+    for _, item in ipairs(items) do
+        if item.PrimaryPart and not item:GetAttribute("PickingUp") then
+            local d = (home.Position - item.PrimaryPart.Position).Magnitude
+            if d < 200 then
+                item:SetAttribute("PickingUp", true)
+                pcall(function() root.CFrame = item.PrimaryPart.CFrame end)
+                task.wait(0.05)
+                local ok, result = pcall(function()
+                    return RemoteFunction:InvokeServer("Pickup", item)
+                end)
+                if (not ok) or (not result) then
+
+                    pcall(function() Remote:FireServer("Pickup", item, true) end)
+                end
+                if item.Parent then
+                    pcall(function() item:SetAttribute("PickingUp", false) end)
+                end
+            end
+        end
+    end
+    pcall(function() root.CFrame = home end)
+end
+
+local function getActiveMysteryBox()
+    local mb = Workspace:FindFirstChild("MapFolder") and Workspace.MapFolder:FindFirstChild("Mystery Box")
+    if not mb then return nil end
+    for _, box in ipairs(mb:GetChildren()) do
+        if box:GetAttribute("Active") then return box end
+    end
+    return nil
+end
+
+local function listMysteryBoxWeapons()
+
+    local names = {"Any"}
+    if Modules and Modules.WeaponInfo then
+        local set = {}
+        for n, info in pairs(Modules.WeaponInfo) do
+            if type(info) == "table" and info.WeaponType == "Gun" and not set[n] then
+                set[n] = true
+                table.insert(names, n)
+            end
+        end
+        table.sort(names, function(a, b)
+            if a == "Any" then return true end
+            if b == "Any" then return false end
+            return a < b
+        end)
+    end
+    return names
+end
+
+local mysteryBoxBusy = false
+local mysteryBoxNoBoxWarned = false
+
+local function mbNotify(title, msg, dur, kind)
+    pcall(function()
+        GuiLibrary:CreateNotification(title, msg, dur or 2, kind or "info")
+    end)
+end
+
+local function autoMysteryBoxTick()
+    if not Flags.AutoMysteryBox or mysteryBoxBusy then return end
+    local box = getActiveMysteryBox()
+    if not box then
+        if not mysteryBoxNoBoxWarned then
+            mbNotify("Mystery Box", "No active box found — waiting...", 2, "warning")
+            mysteryBoxNoBoxWarned = true
+        end
+        return
+    end
+    mysteryBoxNoBoxWarned = false
+
+    if box:GetAttribute("BeingUsed") then
+        if box:GetAttribute("BeingUsed") == LocalPlayer.UserId then
+            local w = box:GetAttribute("Weapon")
+            if w and (Flags.DesiredWeapon == "Any" or w == Flags.DesiredWeapon) then
+                mbNotify("Mystery Box", "Taking weapon: " .. w, 2, "success")
+                pcall(function()
+                    Remote:FireServer("Take Mystery Box Weapon", box)
+                end)
+            end
+        end
+        return
+    end
+
+    mysteryBoxBusy = true
+    task.spawn(function()
+        mbNotify("Mystery Box", "Buying box (target: " .. Flags.DesiredWeapon .. ")", 2, "info")
+        local ok = pcall(function()
+            Remote:FireServer("Buy Mystery Box", box)
+        end)
+        if not ok then
+            mbNotify("Mystery Box", "Buy failed — out of points?", 2, "error")
+            mysteryBoxBusy = false
+            return
+        end
+
+        local startT = tick()
+        local landed = false
+        while tick() - startT < 12 do
+            task.wait(0.1)
+            local w = box:GetAttribute("Weapon")
+            if w and box:GetAttribute("BeingUsed") == LocalPlayer.UserId then
+                if Flags.DesiredWeapon == "Any" or w == Flags.DesiredWeapon then
+                    mbNotify("Mystery Box", "Landed: " .. w .. " — taking it", 2, "success")
+                    pcall(function()
+                        Remote:FireServer("Take Mystery Box Weapon", box)
+                    end)
+                    landed = true
+                    break
+                else
+                    mbNotify("Mystery Box", "Got " .. w .. " — skipping (want " .. Flags.DesiredWeapon .. ")", 2, "warning")
+                    while box:GetAttribute("BeingUsed") and tick() - startT < 12 do
+                        task.wait(0.25)
+                    end
+                    landed = true
+                    break
+                end
+            end
+        end
+        if not landed then
+            mbNotify("Mystery Box", "Timed out — retrying next tick", 2, "warning")
+        end
+        mysteryBoxBusy = false
+    end)
+end
+
+local function getGameStats()
+    return Workspace:FindFirstChild("GameStats")
+end
+
+local function getMapFolder() return Workspace:FindFirstChild("MapFolder") end
+
+local function getEasterEggSpawns(partName)
+    local mf = getMapFolder()
+    local map = mf and mf:FindFirstChild("Map")
+    local mapEl = map and map:FindFirstChild("MapElements")
+    local ees = mapEl and mapEl:FindFirstChild("EasterEggSpawns")
+    return ees and ees:FindFirstChild(partName)
+end
+
+local function getActiveEasterEgg(partName)
+    local folder = getEasterEggSpawns(partName)
+    if not folder then return nil end
+    for _, child in ipairs(folder:GetChildren()) do
+        if child:GetAttribute("Active") and child:FindFirstChild("Base") then
+            return child
+        end
+    end
+    return nil
+end
+
+local function getCollectedCount(partName)
+    local gs = getGameStats()
+    local ms = gs and gs:FindFirstChild("MapStats")
+    local eep = ms and ms:FindFirstChild("EasterEggParts")
+    local v = eep and eep:FindFirstChild(partName)
+    return (v and v.Value) or 0
+end
+
+local function isPowerOn()
+    local gs = getGameStats()
+    local p = gs and gs:FindFirstChild("PowerActivated")
+    return p and p.Value == true
+end
+
+local function getNachtPowerBox()
+    local mf = getMapFolder()
+    local ps = mf and mf:FindFirstChild("Power Switches")
+    return ps and ps:FindFirstChild("NachtPowerBox")
+end
+
+local function getTeleporter()
+    local mf = getMapFolder()
+    local map = mf and mf:FindFirstChild("Map")
+    local mapEl = map and map:FindFirstChild("MapElements")
+    return mapEl and mapEl:FindFirstChild("Teleporter")
+end
+
+local function pickupEasterEggPart(partName)
+    local part = getActiveEasterEgg(partName)
+    if not part then return false, "no active " .. partName end
+
+    local before = getCollectedCount(partName)
+    pcall(function() Remote:FireServer("Pickup Easter Egg Part", part) end)
+    task.wait(0.25)
+    if getCollectedCount(partName) > before then return true, "picked up" end
+
+    local root = getRoot()
+    if root and part:FindFirstChild("Base") then
+        local homeCF = root.CFrame
+        pcall(function() root.CFrame = part.Base.CFrame + Vector3.new(0, 3, 0) end)
+        task.wait(0.1)
+        pcall(function() Remote:FireServer("Pickup Easter Egg Part", part) end)
+        task.wait(0.2)
+        pcall(function() root.CFrame = homeCF end)
+    end
+    return getCollectedCount(partName) > before, "tp+retry"
+end
+
+local powerBusy = false
+local function autoCompletePower()
+    if powerBusy then return false, "already running" end
+    powerBusy = true
+    local function finish(ok, msg, kind)
+        powerBusy = false
+        GuiLibrary:CreateNotification("Auto Power", msg, 3, kind or (ok and "success" or "error"))
+        return ok, msg
+    end
+
+    if getMapFolder() and getGameStats() and getGameStats().Map and getGameStats().Map.Value ~= "Nacht Der Untoten" then
+        return finish(false, "not on Nacht Der Untoten", "warning")
+    end
+    if isPowerOn() then
+        return finish(true, "power already on", "info")
+    end
+    local box = getNachtPowerBox()
+    if not box then return finish(false, "no NachtPowerBox", "error") end
+
+    for _ = 1, 8 do
+        if getCollectedCount("Power Cell") >= 3 then break end
+        local ok = pickupEasterEggPart("Power Cell")
+        if not ok then task.wait(0.5) end
+    end
+    GuiLibrary:CreateNotification("Auto Power",
+        "Cells: " .. getCollectedCount("Power Cell") .. "/3", 2, "info")
+
+    for _ = 1, 3 do
+        if getCollectedCount("Power Handle") >= 1 then break end
+        pickupEasterEggPart("Power Handle")
+        task.wait(0.2)
+    end
+    GuiLibrary:CreateNotification("Auto Power",
+        "Handles: " .. getCollectedCount("Power Handle") .. "/1", 2, "info")
+
+    local root = getRoot()
+    local homeCF = root and root.CFrame
+    local part = box:FindFirstChild("Interaction") or box:FindFirstChildWhichIsA("BasePart", true)
+    if root and part then
+        pcall(function() root.CFrame = part.CFrame + Vector3.new(0, 3, 0) end)
+        task.wait(0.1)
+    end
+    for _ = 1, 8 do
+        local cellsIn  = box:GetAttribute("PowerCell")   or 0
+        local handleIn = box:GetAttribute("PowerHandle") or 0
+        local cellsHave  = getCollectedCount("Power Cell")
+        local handleHave = getCollectedCount("Power Handle")
+        if cellsIn >= cellsHave and handleIn >= handleHave then break end
+        pcall(function() Remote:FireServer("Place Nacht Power Box Part", box) end)
+        task.wait(0.25)
+    end
+    if root and homeCF then
+        pcall(function() root.CFrame = homeCF end)
+    end
+
+    local cellsIn  = box:GetAttribute("PowerCell")   or 0
+    local handleIn = box:GetAttribute("PowerHandle") or 0
+    return finish(true,
+        ("placed %d/3 cells, %d/1 handle"):format(cellsIn, handleIn),
+        (cellsIn >= 3 and handleIn >= 1) and "success" or "warning")
+end
+
+local teleBusy = false
+local function autoCompleteWeaponUpgrader()
+    if teleBusy then return false, "already running" end
+    teleBusy = true
+    local function finish(ok, msg, kind)
+        teleBusy = false
+        GuiLibrary:CreateNotification("Auto Upgrader", msg, 3, kind or (ok and "success" or "error"))
+        return ok, msg
+    end
+
+    local tele = getTeleporter()
+    if not tele then return finish(false, "no Teleporter (wrong map?)", "error") end
+    if tele:GetAttribute("Active") then
+        return finish(true, "upgrader already active", "info")
+    end
+
+    if getCollectedCount("Teleporter Part") < 1 then
+        for _ = 1, 3 do
+            if getCollectedCount("Teleporter Part") >= 1 then break end
+            pickupEasterEggPart("Teleporter Part")
+            task.wait(0.2)
+        end
+    end
+    if getCollectedCount("Teleporter Part") < 1 then
+        return finish(false, "couldn't pick up Teleporter Part", "error")
+    end
+
+    local root = getRoot()
+    local homeCF = root and root.CFrame
+    local part = tele:FindFirstChild("Interaction") or tele:FindFirstChildWhichIsA("BasePart", true)
+    if root and part then
+        pcall(function() root.CFrame = part.CFrame + Vector3.new(0, 3, 0) end)
+        task.wait(0.1)
+    end
+    for _ = 1, 5 do
+        if tele:GetAttribute("Active") then break end
+        pcall(function() Remote:FireServer("Place Nacht Teleporter Part", tele) end)
+        task.wait(0.25)
+    end
+    if root and homeCF then
+        pcall(function() root.CFrame = homeCF end)
+    end
+
+    return finish(tele:GetAttribute("Active") == true,
+        tele:GetAttribute("Active") and "upgrader activated" or "place failed",
+        tele:GetAttribute("Active") and "success" or "warning")
+end
+
+local flyBV, flyBG
+local function destroyFly()
+    if flyBV then flyBV:Destroy(); flyBV = nil end
+    if flyBG then flyBG:Destroy(); flyBG = nil end
+end
+
+local function updateFly()
+    if not Flags.Fly then destroyFly(); return end
+    local root = getRoot()
+    local hum = getHumanoid()
+    if not root or not hum then destroyFly(); return end
+
+    if not flyBV then
+        flyBV = Instance.new("BodyVelocity")
+        flyBV.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+        flyBV.Velocity = Vector3.zero
+        flyBV.Parent = root
+    end
+    if not flyBG then
+        flyBG = Instance.new("BodyGyro")
+        flyBG.MaxTorque = Vector3.new(1e9, 1e9, 1e9)
+        flyBG.D = 100
+        flyBG.P = 1e4
+        flyBG.Parent = root
+    end
+
+    flyBG.CFrame = Camera.CFrame
+
+    local dir = Vector3.zero
+    if UserInputService:IsKeyDown(Enum.KeyCode.W) then dir = dir + Camera.CFrame.LookVector end
+    if UserInputService:IsKeyDown(Enum.KeyCode.S) then dir = dir - Camera.CFrame.LookVector end
+    if UserInputService:IsKeyDown(Enum.KeyCode.A) then dir = dir - Camera.CFrame.RightVector end
+    if UserInputService:IsKeyDown(Enum.KeyCode.D) then dir = dir + Camera.CFrame.RightVector end
+    if UserInputService:IsKeyDown(Enum.KeyCode.Space) then dir = dir + Vector3.new(0,1,0) end
+    if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then dir = dir - Vector3.new(0,1,0) end
+
+    if dir.Magnitude > 0 then dir = dir.Unit * Flags.FlySpeed end
+    flyBV.Velocity = dir
+end
+
+local function applyPlayerMods()
+    local hum = getHumanoid()
+    if hum then
+        if hum.WalkSpeed ~= Flags.WalkSpeed then
+            pcall(function() hum.WalkSpeed = Flags.WalkSpeed end)
+        end
+        if hum.JumpPower ~= Flags.JumpPower then
+            pcall(function() hum.JumpPower = Flags.JumpPower end)
+            pcall(function() hum.JumpHeight = Flags.JumpPower / 3 end)
+        end
+    end
+
+    if Flags.NoClip then
+        local c = getCharacter()
+        if c then
+            for _, p in ipairs(c:GetDescendants()) do
+                if p:IsA("BasePart") then p.CanCollide = false end
+            end
+        end
+    end
+end
+
+local origLighting = {
+    Ambient            = Lighting.Ambient,
+    OutdoorAmbient     = Lighting.OutdoorAmbient,
+    Brightness         = Lighting.Brightness,
+    ClockTime          = Lighting.ClockTime,
+    FogEnd             = Lighting.FogEnd,
+    GlobalShadows      = Lighting.GlobalShadows,
+}
+
+local function applyFullbright()
+    if Flags.FullBright then
+        Lighting.Ambient        = Color3.fromRGB(255,255,255)
+        Lighting.OutdoorAmbient = Color3.fromRGB(255,255,255)
+        Lighting.Brightness     = 2
+        Lighting.ClockTime      = 14
+        Lighting.FogEnd         = 1e9
+        Lighting.GlobalShadows  = false
+    else
+        Lighting.Ambient        = origLighting.Ambient
+        Lighting.OutdoorAmbient = origLighting.OutdoorAmbient
+        Lighting.Brightness     = origLighting.Brightness
+        Lighting.ClockTime      = origLighting.ClockTime
+        Lighting.FogEnd         = origLighting.FogEnd
+        Lighting.GlobalShadows  = origLighting.GlobalShadows
+    end
+end
+
+UserInputService.JumpRequest:Connect(function()
+    if Flags.InfiniteJump then
+        local hum = getHumanoid()
+        if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+    end
+end)
+
+LocalPlayer.Idled:Connect(function()
+    if Flags.AntiAFK then
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(math.max(Flags.KillAllInterval, 0.05))
+        if Flags.KillAllLoop then
+            local needsAmmo = (Flags.KillAllMethod ~= "Melee")
+
+            if needsAmmo and isReloading() then
+
+            elseif (not needsAmmo) or hasAmmo() then
+                if #getZombies() > 0 then
+                    pcall(killAll)
+                end
+            elseif Flags.AutoBuyAmmo then
+
+                pcall(buyAmmo)
+            end
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(1.5)
+        if Flags.AutoBuyAmmo and not hasAmmo() and not isReloading() then
+            pcall(buyAmmo)
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if Flags.AutoScrap then
+            pcall(autoPickupScrapTick)
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if Flags.AutoMysteryBox then
+            pcall(autoMysteryBoxTick)
+        end
+    end
+end)
+
+local function attachFOVEnforce(cam)
+    if not cam then return end
+    cam:GetPropertyChangedSignal("FieldOfView"):Connect(function()
+        if Flags.HighFOV and math.abs(cam.FieldOfView - Flags.FOVValue) > 0.01 then
+            pcall(function() cam.FieldOfView = Flags.FOVValue end)
+        end
+    end)
+end
+attachFOVEnforce(Camera)
+Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    Camera = Workspace.CurrentCamera
+    attachFOVEnforce(Camera)
+end)
+
+local FOV_BIND_NAME = "KorruptCustomFOV"
+pcall(function() RunService:UnbindFromRenderStep(FOV_BIND_NAME) end)
+RunService:BindToRenderStep(FOV_BIND_NAME, Enum.RenderPriority.Last.Value, function()
+    if Flags.HighFOV and Camera then
+        local cur = Camera.FieldOfView
+        if math.abs(cur - Flags.FOVValue) > 0.01 then
+            pcall(function() Camera.FieldOfView = Flags.FOVValue end)
+        end
+    end
+end)
+
+local espTick = 0
+RunService.RenderStepped:Connect(function(dt)
+    applyCombatMods()
+    applyPlayerMods()
+    updateFly()
+    refreshCaches()
+    runAimbot()
+    updateFOVCircles()
+
+    espTick = espTick + dt
+    if espTick > 0.1 then
+        espTick = 0
+        updateESP()
+    end
+end)
+
+GuiLibrary.NotificationsEnabled = true
+GuiLibrary.NotificationDuration = 3
+
+local Window = GuiLibrary:CreateWindow("Korrupt Zombies by dc: cyber_modz", UDim2.new(0, 620, 0, 440))
+
+local CombatTab = GuiLibrary:CreateTab(Window, "Combat")
+GuiLibrary:CreateSection(CombatTab, "Silent Aim")
+
+GuiLibrary:CreateToggle(CombatTab, "Silent Aim", false, function(v)
+    Flags.SilentAim = v
+    GuiLibrary:CreateNotification("Silent Aim", v and "Enabled" or "Disabled", 2, v and "success" or "info")
+end)
+
+GuiLibrary:CreateDropdown(CombatTab, "Target Part", {"Head", "UpperTorso", "LowerTorso", "HumanoidRootPart"}, function(v)
+    Flags.SilentPart = v
+end)
+
+GuiLibrary:CreateSlider(CombatTab, "Silent Aim FOV", 10, 720, 360, function(v)
+    Flags.SilentFOV = v
+end)
+
+GuiLibrary:CreateSlider(CombatTab, "Hit Chance", 1, 100, 100, function(v)
+    Flags.HitChance = v
+end)
+
+GuiLibrary:CreateToggle(CombatTab, "Visible Check", false, function(v)
+    Flags.VisibleCheck = v
+end)
+
+GuiLibrary:CreateToggle(CombatTab, "Show Silent Aim FOV", false, function(v)
+    Flags.SilentFOVShow = v
+end)
+
+GuiLibrary:CreateToggle(CombatTab, "Hook Debug (F9 console)", false, function(v)
+    GuiLibrary:CreateNotification("Hook Debug",
+        v and "Enabled — open F9 console to see hook fires" or "Disabled",
+        2, "info")
+end)
+
+GuiLibrary:CreateColorPicker(CombatTab, "Silent FOV Color", Color3.fromRGB(232, 65, 78), function(c)
+    Flags.SilentFOVColor = c
+end)
+
+GuiLibrary:CreateSection(CombatTab, "Aimbot")
+
+GuiLibrary:CreateToggle(CombatTab, "Aimbot Enabled", false, function(v)
+    Flags.Aimbot = v
+    GuiLibrary:CreateNotification("Aimbot", v and "Enabled" or "Disabled", 2, v and "success" or "info")
+end)
+
+GuiLibrary:CreateDropdown(CombatTab, "Aimbot Mode", {"Memory", "Mouse"}, function(v)
+    Flags.AimbotMode = v
+end)
+
+GuiLibrary:CreateDropdown(CombatTab, "Aimbot Part", {"Head", "UpperTorso", "LowerTorso", "HumanoidRootPart"}, function(v)
+    Flags.AimbotPart = v
+end)
+
+GuiLibrary:CreateSlider(CombatTab, "Aimbot FOV", 10, 720, 120, function(v)
+    Flags.AimbotFOV = v
+end)
+
+GuiLibrary:CreateSlider(CombatTab, "Aimbot Distance", 50, 5000, 1000, function(v)
+    Flags.AimbotDistance = v
+end)
+
+GuiLibrary:CreateSlider(CombatTab, "Aimbot Smoothness", 1, 99, 20, function(v)
+    Flags.AimbotSmoothness = v / 100
+end)
+
+GuiLibrary:CreateSlider(CombatTab, "Aimbot Refresh Rate (Hz)", 30, 240, 60, function(v)
+    Flags.AimbotRefresh = v
+end)
+
+GuiLibrary:CreateSlider(CombatTab, "Aimbot Prediction (s*100)", 0, 50, 16, function(v)
+    Flags.AimbotPrediction = v / 100
+end)
+
+GuiLibrary:CreateToggle(CombatTab, "Sticky Aim", false, function(v) Flags.AimbotSticky = v end)
+GuiLibrary:CreateToggle(CombatTab, "Visible Check (Aimbot)", false, function(v) Flags.AimbotVisCheck = v end)
+
+GuiLibrary:CreateToggle(CombatTab, "Show Aimbot FOV", false, function(v)
+    Flags.AimbotFOVShow = v
+end)
+
+GuiLibrary:CreateColorPicker(CombatTab, "Aimbot FOV Color", Color3.fromRGB(85, 170, 255), function(c)
+    Flags.AimbotFOVColor = c
+end)
+
+GuiLibrary:CreateSection(CombatTab, "Weapon Mods")
+
+GuiLibrary:CreateToggle(CombatTab, "Rapid Fire", false, function(v)
+    Flags.RapidFire = v
+end)
+
+GuiLibrary:CreateSlider(CombatTab, "Fire Rate (RPM)", 60, 3000, 1200, function(v)
+    Flags.RapidFireRate = v
+end)
+
+GuiLibrary:CreateToggle(CombatTab, "No Recoil", false, function(v) Flags.NoRecoil = v end)
+GuiLibrary:CreateToggle(CombatTab, "No Spread",  false, function(v) Flags.NoSpread  = v end)
+GuiLibrary:CreateToggle(CombatTab, "No Sway",    false, function(v) Flags.NoSway    = v end)
+GuiLibrary:CreateToggle(CombatTab, "Always Headshot", false, function(v) Flags.OneShotKill = v end)
+
+GuiLibrary:CreateSection(CombatTab, "Mass Kill")
+
+GuiLibrary:CreateDropdown(CombatTab, "Kill All Method", {"Flamethrower", "Weapon", "Melee"}, function(v)
+    Flags.KillAllMethod = v
+end)
+
+GuiLibrary:CreateSlider(CombatTab, "Kill All Speed (interval ms)", 50, 3000, 1000, function(v)
+    Flags.KillAllInterval = v / 1000
+end)
+
+GuiLibrary:CreateButton(CombatTab, "Kill All Zombies", function()
+    if Flags.KillAllMethod ~= "Melee" and not hasAmmo() then
+        GuiLibrary:CreateNotification("Kill All", "No ammo!", 2, "error")
+        return
+    end
+    local ok, msg = killAll()
+    GuiLibrary:CreateNotification("Kill All",
+        ok and msg or ("failed: " .. (msg or "?")),
+        2, ok and "warning" or "error")
+end)
+
+GuiLibrary:CreateToggle(CombatTab, "Auto Kill All Loop", false, function(v)
+    Flags.KillAllLoop = v
+    GuiLibrary:CreateNotification("Auto Kill All",
+        v and "Enabled" or "Disabled",
+        2, v and "success" or "info")
+end)
+
+GuiLibrary:CreateToggle(CombatTab, "Auto Buy Ammo", false, function(v)
+    Flags.AutoBuyAmmo = v
+    GuiLibrary:CreateNotification("Auto Buy Ammo",
+        v and "Will buy from wall when empty" or "Disabled",
+        2, v and "success" or "info")
+end)
+
+GuiLibrary:CreateButton(CombatTab, "Buy Ammo Now", function()
+    local ok, msg = buyAmmo()
+    GuiLibrary:CreateNotification("Buy Ammo", msg, 2, ok and "success" or "error")
+end)
+
+local VisualsTab = GuiLibrary:CreateTab(Window, "Visuals")
+GuiLibrary:CreateSection(VisualsTab, "ESP")
+
+GuiLibrary:CreateToggle(VisualsTab, "ESP Enabled", false, function(v) Flags.ESP = v end)
+GuiLibrary:CreateToggle(VisualsTab, "Boxes",       true, function(v) Flags.ESPBox = v end)
+GuiLibrary:CreateToggle(VisualsTab, "Names",       true, function(v) Flags.ESPName = v end)
+GuiLibrary:CreateToggle(VisualsTab, "Health",      true, function(v) Flags.ESPHealth = v end)
+GuiLibrary:CreateToggle(VisualsTab, "Distance",    true, function(v) Flags.ESPDistance = v end)
+GuiLibrary:CreateToggle(VisualsTab, "Tracers",     false, function(v) Flags.ESPTracers = v end)
+GuiLibrary:CreateToggle(VisualsTab, "Chams (Fill)",false, function(v) Flags.Chams = v end)
+
+GuiLibrary:CreateColorPicker(VisualsTab, "ESP Color", Color3.fromRGB(232, 65, 78), function(c)
+    Flags.ESPColor = c
+end)
+
+GuiLibrary:CreateColorPicker(VisualsTab, "Chams Color", Color3.fromRGB(232, 65, 78), function(c)
+    Flags.ChamsColor = c
+end)
+
+GuiLibrary:CreateSlider(VisualsTab, "Max ESP Distance", 100, 5000, 2000, function(v)
+    Flags.ESPMaxDistance = v
+end)
+
+GuiLibrary:CreateSection(VisualsTab, "World")
+GuiLibrary:CreateToggle(VisualsTab, "Fullbright", false, function(v)
+    Flags.FullBright = v
+    applyFullbright()
+end)
+
+GuiLibrary:CreateToggle(VisualsTab, "Custom FOV", false, function(v)
+    Flags.HighFOV = v
+end)
+
+GuiLibrary:CreateSlider(VisualsTab, "FOV", 60, 120, 90, function(v)
+    Flags.FOVValue = v
+    if Flags.HighFOV then
+        pcall(function() Camera.FieldOfView = v end)
+    end
+end)
+
+local PlayerTab = GuiLibrary:CreateTab(Window, "Player")
+GuiLibrary:CreateSection(PlayerTab, "Movement")
+
+GuiLibrary:CreateSlider(PlayerTab, "Walk Speed", 16, 200, 16, function(v)
+    Flags.WalkSpeed = v
+end)
+
+GuiLibrary:CreateSlider(PlayerTab, "Jump Power", 50, 500, 50, function(v)
+    Flags.JumpPower = v
+end)
+
+GuiLibrary:CreateToggle(PlayerTab, "Infinite Jump", false, function(v) Flags.InfiniteJump = v end)
+GuiLibrary:CreateToggle(PlayerTab, "No Clip",       false, function(v) Flags.NoClip = v end)
+GuiLibrary:CreateToggle(PlayerTab, "Fly",           false, function(v) Flags.Fly = v end)
+GuiLibrary:CreateSlider(PlayerTab, "Fly Speed", 10, 300, 50, function(v) Flags.FlySpeed = v end)
+
+GuiLibrary:CreateSection(PlayerTab, "Teleport")
+GuiLibrary:CreateButton(PlayerTab, "Teleport to Mystery Box", function()
+    local box = getActiveMysteryBox()
+    local root = getRoot()
+    if not box then
+        GuiLibrary:CreateNotification("Teleport", "No active Mystery Box right now", 2, "error")
+        return
+    end
+    if not root then return end
+    local part = box:FindFirstChildWhichIsA("BasePart", true)
+    if part then
+        root.CFrame = part.CFrame + Vector3.new(0, 5, 0)
+        GuiLibrary:CreateNotification("Teleport", "Teleported to active Mystery Box", 2, "success")
+    end
+end)
+
+GuiLibrary:CreateButton(PlayerTab, "Teleport to Random Zombie", function()
+    local zs = getZombies()
+    if #zs == 0 then
+        GuiLibrary:CreateNotification("Teleport", "No zombies found", 2, "error")
+        return
+    end
+    local target = zs[math.random(1, #zs)]
+    local root = getRoot()
+    if root then
+        local tr = target:FindFirstChild("HumanoidRootPart")
+        if tr then
+            root.CFrame = tr.CFrame * CFrame.new(0, 0, 5)
+        end
+    end
+end)
+
+local MiscTab = GuiLibrary:CreateTab(Window, "Misc")
+GuiLibrary:CreateSection(MiscTab, "General")
+
+GuiLibrary:CreateToggle(MiscTab, "Anti-AFK", true, function(v) Flags.AntiAFK = v end)
+
+GuiLibrary:CreateButton(MiscTab, "Rejoin Server", function()
+    local TeleportService = game:GetService("TeleportService")
+    pcall(function() TeleportService:Teleport(game.PlaceId, LocalPlayer) end)
+end)
+
+GuiLibrary:CreateButton(MiscTab, "Reset Character", function()
+    local hum = getHumanoid()
+    if hum then hum.Health = 0 end
+end)
+
+GuiLibrary:CreateSection(MiscTab, "Pickups")
+GuiLibrary:CreateToggle(MiscTab, "Auto Pickup Scrap", false, function(v)
+    Flags.AutoScrap = v
+    GuiLibrary:CreateNotification("Auto Scrap",
+        v and "Enabled" or "Disabled", 2, v and "success" or "info")
+end)
+
+GuiLibrary:CreateButton(MiscTab, "Pickup Scrap Now", function()
+    local n = #scrapTargets()
+    autoPickupScrapTick()
+    GuiLibrary:CreateNotification("Scrap", "Tried to pick up " .. n .. " items", 2, "info")
+end)
+
+GuiLibrary:CreateToggle(MiscTab, "Auto Repair Barricades", false, function(v)
+    Flags.AutoRepair = v
+    GuiLibrary:CreateNotification("Auto Repair",
+        v and "Repairs damaged barricades every 2s (50 pts each)" or "Disabled",
+        2, v and "success" or "info")
+end)
+
+GuiLibrary:CreateButton(MiscTab, "Repair Barricades Now", function()
+    local n = #listDamagedBarricades()
+    if n == 0 then
+        GuiLibrary:CreateNotification("Repair", "No damaged barricades", 2, "info")
+        return
+    end
+    task.spawn(function()
+        local _, msg = repairAllBarricades()
+        GuiLibrary:CreateNotification("Repair", msg, 3, "success")
+    end)
+end)
+
+GuiLibrary:CreateSection(MiscTab, "Mystery Box")
+
+local mbWeapons = listMysteryBoxWeapons()
+GuiLibrary:CreateDropdown(MiscTab, "Desired Weapon", mbWeapons, function(v)
+    Flags.DesiredWeapon = v
+end)
+
+GuiLibrary:CreateToggle(MiscTab, "Auto Mystery Box", false, function(v)
+    Flags.AutoMysteryBox = v
+    GuiLibrary:CreateNotification("Mystery Box",
+        v and ("Will buy until you get: " .. Flags.DesiredWeapon) or "Disabled",
+        3, v and "success" or "info")
+end)
+
+GuiLibrary:CreateButton(MiscTab, "Buy Active Mystery Box", function()
+    local box = getActiveMysteryBox()
+    if not box then
+        GuiLibrary:CreateNotification("Mystery Box", "No active box found", 2, "error")
+        return
+    end
+    GuiLibrary:CreateNotification("Mystery Box", "Buying box (target: " .. Flags.DesiredWeapon .. ")", 2, "info")
+    pcall(function() Remote:FireServer("Buy Mystery Box", box) end)
+
+    task.spawn(function()
+        local startT = tick()
+        while tick() - startT < 12 do
+            task.wait(0.1)
+            local w = box:GetAttribute("Weapon")
+            if w and box:GetAttribute("BeingUsed") == LocalPlayer.UserId then
+                if Flags.DesiredWeapon == "Any" or w == Flags.DesiredWeapon then
+                    pcall(function() Remote:FireServer("Take Mystery Box Weapon", box) end)
+                    GuiLibrary:CreateNotification("Mystery Box", "Picked up: " .. w, 2, "success")
+                else
+                    GuiLibrary:CreateNotification("Mystery Box", "Got " .. w .. " — skipping (want " .. Flags.DesiredWeapon .. ")", 2, "warning")
+                end
+                return
+            end
+        end
+        GuiLibrary:CreateNotification("Mystery Box", "Buy timed out", 2, "error")
+    end)
+end)
+
+GuiLibrary:CreateSection(MiscTab, "Map Easter Eggs (Nacht)")
+
+GuiLibrary:CreateButton(MiscTab, "Auto Complete Power", function()
+    if isPowerOn() then
+        GuiLibrary:CreateNotification("Auto Power", "Power already on", 2, "info")
+        return
+    end
+    task.spawn(autoCompletePower)
+end)
+
+GuiLibrary:CreateButton(MiscTab, "Auto Complete Weapon Upgrader", function()
+    local tele = getTeleporter()
+    if tele and tele:GetAttribute("Active") then
+        GuiLibrary:CreateNotification("Auto Upgrader", "Already active", 2, "info")
+        return
+    end
+    task.spawn(autoCompleteWeaponUpgrader)
+end)
+
+GuiLibrary:CreateSection(MiscTab, "Doors & Pack-A-Punch")
+
+GuiLibrary:CreateButton(MiscTab, "Buy All Doors", function()
+    local _, msg = buyAllDoors()
+    GuiLibrary:CreateNotification("Doors", msg, 2, "info")
+end)
+
+GuiLibrary:CreateButton(MiscTab, "Pack-A-Punch Held Weapon", function()
+    local ok, why = canPackCurrentWeapon()
+    if not ok then
+        GuiLibrary:CreateNotification("Pack-A-Punch", why, 2, "warning")
+        return
+    end
+    task.spawn(autoPackAPunch)
+end)
+
+GuiLibrary:CreateButton(MiscTab, "Dump Weapon Info", function()
+    local wd = getCurrentWeaponData()
+    if wd then
+                        if wd.SlotData then
+                                            end
+        if wd.WeaponMultipliers then
+            for k, v in pairs(wd.WeaponMultipliers) do
+                            end
+        end
+        GuiLibrary:CreateNotification("Dump", "Printed to console (F9)", 2, "info")
+    else
+        GuiLibrary:CreateNotification("Dump", "No weapon equipped", 2, "warning")
+    end
+end)
+
+GuiLibrary:CreateSection(MiscTab, "Keybinds")
+
+GuiLibrary:CreateKeybind(MiscTab, "Toggle Silent Aim", nil, function()
+    Flags.SilentAim = not Flags.SilentAim
+    GuiLibrary:CreateNotification("Silent Aim",
+        Flags.SilentAim and "Enabled" or "Disabled", 1.5,
+        Flags.SilentAim and "success" or "info")
+end)
+
+GuiLibrary:CreateKeybind(MiscTab, "Toggle Aimbot", nil, function()
+    Flags.Aimbot = not Flags.Aimbot
+    GuiLibrary:CreateNotification("Aimbot",
+        Flags.Aimbot and "Enabled" or "Disabled", 1.5,
+        Flags.Aimbot and "success" or "info")
+end)
+
+GuiLibrary:CreateKeybind(MiscTab, "Toggle Fly", nil, function()
+    Flags.Fly = not Flags.Fly
+    GuiLibrary:CreateNotification("Fly",
+        Flags.Fly and "Enabled" or "Disabled", 1.5,
+        Flags.Fly and "success" or "info")
+end)
+
+GuiLibrary:CreateKeybind(MiscTab, "Toggle NoClip", nil, function()
+    Flags.NoClip = not Flags.NoClip
+    GuiLibrary:CreateNotification("NoClip",
+        Flags.NoClip and "Enabled" or "Disabled", 1.5,
+        Flags.NoClip and "success" or "info")
+end)
+
+GuiLibrary:CreateKeybind(MiscTab, "Kill All Hotkey", nil, function()
+    killAll()
+end)
+
+GuiLibrary:CreateNotification("Korrupt Zombies", "Loaded successfully!", 4, "success")
