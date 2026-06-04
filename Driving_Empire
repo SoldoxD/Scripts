@@ -1,6 +1,3 @@
-
-print("[DE] starting load")
-
 local libSrc
 do
     local ok, src = pcall(function() return game:HttpGet("https://raw.githubusercontent.com/SoldoxD/libery/refs/heads/main/main") end)
@@ -74,7 +71,6 @@ local SecurityUtil      = getModule("Modules", "Shared", "Jobs", "Security", "Se
 local DeliveryJobTask   = getModule("Modules", "Client", "Jobs", "Tasks", "DeliveryJobTask")
 local VehicleController = getModule("Modules", "Client", "Vehicles", "VehicleController")
 
--- Direct remote helpers (some remotes are fired by literal name)
 local function fireRemoteEvent(name, ...)
     local args = table.pack(...)
     local ok = pcall(function()
@@ -95,7 +91,6 @@ local function notify(title, msg, dur, kind)
     GuiLibrary:CreateNotification(title, msg, dur or 3, kind or "info")
 end
 
--- Anti-idle (always on): reset the AFK timer whenever the game flags us idle.
 do
     local ok, VirtualUser = pcall(game.GetService, game, "VirtualUser")
     if ok and VirtualUser then
@@ -110,8 +105,6 @@ do
     end
 end
 
--- Fast loading: hide the game's loading / teleport screens early so they go
--- away ASAP (the world keeps streaming in the background).
 local FastLoad = { Enabled = false }
 local function killLoadingScreens()
     pcall(function() game:GetService("ReplicatedFirst"):RemoveDefaultLoadingScreen() end)
@@ -552,7 +545,6 @@ local function bustOneATM(entry)
         if not waitForBustDebounceClear(8) then return false, "ATMBustDebounce" end
     end
 
-    -- Server validates distance to atm model pivot, so stand right on it.
     local pivotPos = atmPivotPos(atm, adornee)
     if not pivotPos then return false, "noPivot" end
     local function standNear()
@@ -743,18 +735,18 @@ local function runHeistOnce()
 end
 
 task.spawn(function()
-    print("[DE][CRIM] FSM loop started")
+
     while true do
         task.wait(0.4)
         if not AutoFarm.Enabled then AutoFarm.Phase = "idle" continue end
         if isInSeat() then
-            if AutoFarm.Phase ~= "inSeat" then print("[DE][CRIM] in seat, pausing") end
+            if AutoFarm.Phase ~= "inSeat" then  end
             AutoFarm.Phase = "inSeat"
             continue
         end
 
         if (LocalPlayer:GetAttribute("JobId") or "") ~= "Criminal" then
-            print("[DE][CRIM] not Criminal, joining job. current JobId:", LocalPlayer:GetAttribute("JobId"))
+
             joinCriminalJob()
             task.wait(0.5)
             continue
@@ -788,8 +780,6 @@ task.spawn(function()
             continue
         end
 
-        -- Bank heist now requires NO wanted level. Only run it when the
-        -- player has 0 stars and isn't wanted.
         local canHeist = getStars() == 0 and not isWanted()
         if canHeist and isAnyHeistOpen() then
             runHeistOnce()
@@ -937,7 +927,7 @@ end
 
 local function GetBestOwnedCar()
     if MANUAL_BEST_CAR and MANUAL_BEST_CAR ~= "" then
-        print("[DE][BASIC] Using manually set best car:", MANUAL_BEST_CAR)
+
         return MANUAL_BEST_CAR
     end
 
@@ -981,7 +971,6 @@ local function GetBestOwnedCar()
 
     local foundList = {}
     for k in pairs(ownedCars) do table.insert(foundList, k) end
-    print("[DE][BASIC] Cars detected as owned:", #foundList > 0 and table.concat(foundList, ", ") or "NONE")
 
     for _, carName in ipairs(GOOD_CARS_PRIORITY) do
         if ownedCars[carName] then
@@ -997,7 +986,6 @@ local function GetBestOwnedCar()
 end
 
 local function ensureBestCarSpawnedAndEntered()
-    print("[DE][BASIC] Ensuring best car is spawned and player is inside...")
 
     local hrp = getHRP()
     if not hrp then
@@ -1024,7 +1012,6 @@ local function ensureBestCarSpawnedAndEntered()
         }
         VEHICLE_REMOTE_PATH:FireServer(unpack(args))
     end)
-    print("[DE][BASIC] Attempting to spawn best owned car:", bestCarToSpawn)
 
     task.wait(CAR_SPAWN_WAIT)
 
@@ -1101,8 +1088,6 @@ local function ensureBestCarSpawnedAndEntered()
     local foundName = bestCar.Name
     local requestedName = bestCarToSpawn or "Unknown"
 
-    print("[DE][BASIC] Found car:", foundName, "after", math.floor(tick() - startTime), "seconds")
-
     if not string.lower(foundName):find(string.lower(requestedName)) then
         warn("══════════════════════════════════════════════════════════════")
         warn("[DE][BASIC] WARNING: We tried to spawn '" .. requestedName .. "' but found '" .. foundName .. "' instead.")
@@ -1135,13 +1120,10 @@ local function ensureBestCarSpawnedAndEntered()
     cam.CameraType = oldType or Enum.CameraType.Custom
 
     task.wait(0.3)
-    print("[DE][BASIC] Player should now be in the best car.")
+
     return true
 end
 
--- =============================================================================
--- POLICE: Crime Scene farm + Auto-Arrest
--- =============================================================================
 local Police = { CrimeScene = false, Arrest = false, CSStats = 0, ArrStats = 0, Running = false, ArrRunning = false }
 
 local function joinSecurityJob() startJobSession("Security") end
@@ -1168,8 +1150,6 @@ local function csPos(cs)
     return ok and pv and pv.Position or (cs:IsA("BasePart") and cs.Position) or nil
 end
 
--- Crime scenes are at fixed spawner positions, so we iterate them directly
--- (sorted by distance) and use each unused one. No hunt positions needed.
 local function getSortedCrimeScenes()
     local list = {}
     local hrp = getHRP()
@@ -1189,7 +1169,7 @@ end
 
 local function useCrimeSceneOnce(cs, pos)
     if not Remotes then return false, "noModules" end
-    -- Wait out any using debounce before starting
+
     local dstop = tick() + 6
     while hasCrimeSceneDebounce() and tick() < dstop do task.wait(0.1) end
 
@@ -1223,8 +1203,7 @@ task.spawn(function()
         end
         local scenes = getSortedCrimeScenes()
         if #scenes == 0 then task.wait(1); continue end
-        -- Use them in distance order; each successful use marks it Used so it
-        -- won't reappear next pass.
+
         for _, e in ipairs(scenes) do
             if not Police.CrimeScene then break end
             requestStreamAround(e.pos)
@@ -1235,7 +1214,6 @@ task.spawn(function()
     end
 end)
 
--- Auto-arrest: find wanted criminals, get near, notify-start, request arrest.
 local function getWantedCriminals()
     local out = {}
     for _, plr in ipairs(Players:GetPlayers()) do
@@ -1285,9 +1263,6 @@ task.spawn(function()
     end
 end)
 
--- =============================================================================
--- DELIVERY: full auto farm using state Pickup/Destination positions
--- =============================================================================
 local AutoDelivery = { Enabled = false, Delay = 0.45 }
 local function getDeliveryState()
     if not DeliveryJobTask or not DeliveryJobTask.GetCurrentDeliveryState then return nil end
@@ -1312,8 +1287,7 @@ local function nearestDeliveryLocationTo(pos)
     end
     return best
 end
--- Teleport the player OR their car (so delivery packages, which ride in the
--- vehicle, come along). Returns true if a car was moved.
+
 local function teleportEntity(pos, yOff)
     yOff = yOff or 5
     local model = getDrivenVehicleModel and getDrivenVehicleModel()
@@ -1341,7 +1315,7 @@ local function deliveryGoInteract(targetPos, label)
     local d = math.max(0.1, AutoDelivery.Delay or 0.45)
     teleportEntity(targetPos, 5)
     task.wait(d)
-    -- Interact a few times to ensure the server registers the zone entry
+
     for _ = 1, 3 do
         pcall(function() Remotes.fireServer("DeliveryLocationInteracted", loc) end)
         task.wait(d * 0.8)
@@ -1362,14 +1336,10 @@ task.spawn(function()
         local carried = st.ItemsCarried or 0
         local cap = st.MaxCapacity or 4
 
-        -- PICKUP PHASE: keep collecting while there's a pickup target and
-        -- we're not full yet. Wait for ItemsCarried to actually rise before
-        -- moving on, so we never deliver a half-empty load.
         if st.PickupPosition and carried < cap then
             local ok, loc = deliveryGoInteract(st.PickupPosition, "pickup")
             if ok and loc then
-                -- wait up to 2s for the pickup to register (carried increases
-                -- or the pickup position clears)
+
                 local before = carried
                 local stop = tick() + 2
                 while tick() < stop and AutoDelivery.Enabled do
@@ -1383,14 +1353,13 @@ task.spawn(function()
             continue
         end
 
-        -- DROPOFF PHASE: we have packages (or no more pickups). Deliver them.
         if st.DestinationPosition then
             local ok, loc = deliveryGoInteract(st.DestinationPosition, "dropoff")
             if ok and loc then
                 local stop = tick() + 2.5
                 while tick() < stop and AutoDelivery.Enabled do
                     local s2 = getDeliveryState()
-                    -- delivery done when state clears or carried drops to 0
+
                     if not s2 or (s2.ItemsCarried or 0) == 0 then break end
                     task.wait(0.2)
                 end
@@ -1403,9 +1372,6 @@ task.spawn(function()
     end
 end)
 
--- =============================================================================
--- PLAYTIME REWARDS auto-claim  (PlayRewards:FireServer(index, false))
--- =============================================================================
 local PlaytimeRewards = { Enabled = false }
 local function claimAllPlaytime()
     for i = 1, 12 do
@@ -1422,12 +1388,6 @@ task.spawn(function()
     end
 end)
 
--- =============================================================================
--- RAINBOW CAR (server-side, others can see it)
--- Uses CustomizationPurchase("Paint", section, vehicleId, {Color=...}).
--- It's a RemoteFunction (server round-trip), so we cycle on an interval
--- instead of every frame to stay smooth and avoid rate limits.
--- =============================================================================
 local Rainbow = { Enabled = false, Speed = 0.5, Interval = 0.4, Sections = { "Primary", "Secondary" } }
 local function applyPaint(section, vehicleId, col)
     return invokeRemoteFunction("CustomizationPurchase", "Paint", section, vehicleId, { Color = col })
@@ -1448,11 +1408,6 @@ task.spawn(function()
     end
 end)
 
--- =============================================================================
--- VEHICLE FLY: control the car in the air with WASD + Space/Shift.
---   W/S = forward/back (camera dir), A/D = strafe, Space = up, Shift = down.
---   No input = hover in place. Works only while seated in a vehicle.
--- =============================================================================
 local VehFly = { Enabled = false, Speed = 80 }
 task.spawn(function()
     while true do
@@ -1478,9 +1433,6 @@ task.spawn(function()
     end
 end)
 
--- =============================================================================
--- ANTI-FLIP: auto-upright the driven vehicle if it rolls over
--- =============================================================================
 local AntiFlip = { Enabled = false }
 task.spawn(function()
     while true do
@@ -1491,7 +1443,7 @@ task.spawn(function()
         local ok, pivot = pcall(function() return model:GetPivot() end)
         if not ok or not pivot then continue end
         if pivot.UpVector.Y < 0.4 then
-            -- flatten: keep position + forward heading, remove roll/pitch
+
             local fwd = pivot.LookVector
             local flatFwd = Vector3.new(fwd.X, 0, fwd.Z)
             if flatFwd.Magnitude < 0.01 then flatFwd = Vector3.new(0, 0, -1) end
@@ -1509,10 +1461,6 @@ task.spawn(function()
     end
 end)
 
--- =============================================================================
--- AUTO COLLECT CASH DROPS (free money from world drops, via touch)
--- =============================================================================
--- Player on-foot speed
 local PlayerMods = { WalkEnabled = false, WalkSpeed = 32 }
 task.spawn(function()
     while true do
@@ -1541,26 +1489,19 @@ task.spawn(function()
     end
 end)
 
--- =============================================================================
--- CAR MODS: live-modify the chassis controller's Tune table.
--- The client owns its vehicle's physics, so scaling TransmissionSpeeds (top
--- speed), TransmissionTorque (acceleration), BrakeTorque and traction takes
--- effect immediately. We snapshot the game's base tune so toggling off (or
--- switching cars) restores stock values.
--- =============================================================================
 local CarMods = {
     Enabled   = false,
-    SpeedMult = 1,   -- top speed
-    AccelMult = 1,   -- acceleration
-    BrakeMult = 1,   -- braking force
-    GripMult  = 1,   -- traction
-    TurnMult  = 1,   -- steering speed
-    NitroMult = 1,   -- nitrous force
+    SpeedMult = 1,
+    AccelMult = 1,
+    BrakeMult = 1,
+    GripMult  = 1,
+    TurnMult  = 1,
+    NitroMult = 1,
     InfNitro  = false,
     InstantStop = false,
 }
-local _modTuneRef = nil   -- identity of the tune we snapshotted
-local _baseTune   = nil   -- snapshot of stock values
+local _modTuneRef = nil
+local _baseTune   = nil
 
 local function snapshotTune(t)
     local snap = {
@@ -1607,7 +1548,6 @@ task.spawn(function()
         local t = ctrl.Tune
         if type(t) ~= "table" then continue end
 
-        -- Re-snapshot whenever the game swaps in a fresh tune table
         if t ~= _modTuneRef then
             _modTuneRef = t
             _baseTune = snapshotTune(t)
@@ -1622,7 +1562,6 @@ task.spawn(function()
             _modsDirty = false
         end
 
-        -- Infinite nitro: keep the boost supply topped up every frame
         if CarMods.InfNitro then
             pcall(function()
                 if t.NitrousSupplyTime then
@@ -1632,8 +1571,6 @@ task.spawn(function()
             end)
         end
 
-        -- Instant stop: when the player brakes (or handbrakes), zero the
-        -- car's horizontal velocity so it halts immediately.
         if CarMods.InstantStop then
             pcall(function()
                 local braking = (ctrl.BrakeInput and ctrl.BrakeInput > 0.5) or ctrl.Handbrake
@@ -1654,9 +1591,6 @@ task.spawn(function()
     end
 end)
 
--- =============================================================================
--- ESP (compact player ESP via Drawing API)
--- =============================================================================
 local ESP = {
     Enabled = false, Box = true, Name = true, Distance = true,
     Tracer = false, HealthBar = true, TeamCheck = false,
@@ -2655,7 +2589,7 @@ do
         ))
     end
     RecordedPath = cframes
-    print(("[DE][REPLAY] Hardcoded path: %d waypoints"):format(#RecordedPath))
+
 end
 
 local PathReplay = {
@@ -2748,7 +2682,7 @@ CarFarm.UseAdvancedLanePlanning = true
 CarFarm.UseArrowBias            = false
 
 GuiLibrary:CreateToggle(tabCar, "Car Auto Farm", false, function(s)
-    print("[DE][CAR] toggle:", s)
+
     if s then
         CarFarm.Enabled = false
         task.wait(0.1)
@@ -2824,7 +2758,6 @@ GuiLibrary:CreateButton(tabCar, "Despawn Vehicle", function()
     pcall(function() ReplicatedStorage.Remotes.VehicleEvent:FireServer("Despawn") end)
 end)
 
--- ── Police section ──
 GuiLibrary:CreateSection(tabPolice, "Security Job")
 GuiLibrary:CreateButton(tabPolice, "Join Security Job", function()
     joinSecurityJob()
@@ -2843,7 +2776,6 @@ end)
 GuiLibrary:CreateSection(tabPolice, "Status")
 local lblPolice = GuiLibrary:CreateLabel(tabPolice, "Idle")
 
--- ── Delivery tab ──
 GuiLibrary:CreateSection(tabDelivery, "Delivery Job")
 GuiLibrary:CreateButton(tabDelivery, "Join Delivery Job", function()
     joinDeliveryJob()
@@ -2866,7 +2798,6 @@ end)
 GuiLibrary:CreateSection(tabDelivery, "Status")
 local lblDelivery = GuiLibrary:CreateLabel(tabDelivery, "Idle")
 
--- ── ESP tab ──
 GuiLibrary:CreateSection(tabESP, "Player ESP")
 GuiLibrary:CreateToggle(tabESP, "Enable ESP", false, function(s) ESP.Enabled = s end)
 GuiLibrary:CreateToggle(tabESP, "Box", true, function(s) ESP.Box = s end)
@@ -2877,7 +2808,6 @@ GuiLibrary:CreateToggle(tabESP, "Tracers", false, function(s) ESP.Tracer = s end
 GuiLibrary:CreateToggle(tabESP, "Team Check (hide allies)", false, function(s) ESP.TeamCheck = s end)
 GuiLibrary:CreateSlider(tabESP, "Max Distance", 100, 5000, 2000, function(v) ESP.MaxDist = v end)
 
--- ── Teleports tab ──
 local TELE_LOCATIONS = {
     { "Spawn",            Vector3.new(-300, 16, -1698) },
     { "ATM Area",         Vector3.new(-2060, 16, 3415) },
@@ -2969,25 +2899,14 @@ end)
 
 GuiLibrary:CreateSection(tabMisc, "Debug")
 GuiLibrary:CreateButton(tabMisc, "Print Status", function()
-    print("================ [DE] STATUS ================")
-    print("Phase:", AutoFarm.Phase, "| Enabled:", AutoFarm.Enabled)
-    print("Job:", LocalPlayer:GetAttribute("JobId"))
-    print("Stars:", getStars(), "| Wanted:", isWanted())
-    print("Bags:", countMoneyBags(), "| Has bag:", playerHasAnyBag())
-    print("ATM debounce:", hasATMBustDebounce())
-    print("Visible ATMs:", #listAvailableATMs())
-    print("InHeist:", inHeistNow())
-    print("Heist data cache:", _heistDataCache and "loaded" or "nil")
+
     if _heistDataCache then
         for id, data in pairs(_heistDataCache) do
             local active, secLeft = computeHeistState(id, data)
-            print(("  %s: active=%s secLeft=%.0f"):format(id, tostring(active), secLeft))
+
         end
     end
-    print("Dropoff:", getDropoffSpawner() and "streamed" or "fallback")
-    print("Stats:", AutoFarm.Stats.ATMs, "ATMs |", AutoFarm.Stats.Heists, "heists |",
-          AutoFarm.Stats.Deposits, "deposits |", AutoFarm.Stats.Failed, "fails")
-    print("=============================================")
+
     notify("Debug", "Printed to console.", 2, "info")
 end)
 
@@ -3035,4 +2954,3 @@ task.spawn(function()
 end)
 
 notify("Driving Empire", "Loaded", 4, "success")
-print("[DE] script ready")
