@@ -10,6 +10,28 @@ local lokc, libRet = pcall(libFn)
 if not lokc then warn("[DE] running lib failed:", libRet); return end
 local GuiLibrary = libRet
 
+-- Re-running this script used to stack a second copy on top of the first:
+-- two drive loops both PivotTo-ing the same car, doubled ESP, a second GUI.
+-- Every loop below runs only while it is the current generation, and the
+-- previous generation's connections and GUI are torn down here.
+local GEN
+do
+    local g = (getgenv and getgenv()) or nil
+    if g then
+        if g.__DE_CLEANUP then pcall(g.__DE_CLEANUP) end
+        g.__DE_GEN = (g.__DE_GEN or 0) + 1
+        GEN = g.__DE_GEN
+    else
+        GEN = 1
+    end
+end
+local function alive()
+    local g = (getgenv and getgenv()) or nil
+    return (g == nil) or g.__DE_GEN == GEN
+end
+local _conns = {}
+local function track(conn) table.insert(_conns, conn) return conn end
+
 local function _elevate()
     local s = (setthreadidentity or (syn and syn.set_thread_identity) or setidentity)
     if s then pcall(s, 8) end
@@ -70,6 +92,9 @@ local SecurityConstants = getModule("Modules", "Shared", "Jobs", "Security", "Se
 local SecurityUtil      = getModule("Modules", "Shared", "Jobs", "Security", "SecurityUtil")
 local DeliveryJobTask   = getModule("Modules", "Client", "Jobs", "Tasks", "DeliveryJobTask")
 local VehicleController = getModule("Modules", "Client", "Vehicles", "VehicleController")
+local VehicleUtil       = getModule("Modules", "Shared", "Vehicles", "VehicleUtil")
+local VehicleData       = getModule("Modules", "Shared", "DataManager", "Data", "VehicleData")
+local PlayerData        = getModule("Modules", "Shared", "Data")
 
 local function fireRemoteEvent(name, ...)
     local args = table.pack(...)
@@ -121,7 +146,7 @@ local function killLoadingScreens()
     end
 end
 task.spawn(function()
-    while true do
+    while alive() do
         task.wait(0.25)
         if FastLoad.Enabled then pcall(killLoadingScreens) end
     end
@@ -142,10 +167,6 @@ end
 local function tp(cf)
     local h = getHRP()
     if h then h.CFrame = cf end
-end
-local function distTo(part)
-    local h = getHRP()
-    return (h and part) and (h.Position - part.Position).Magnitude or math.huge
 end
 
 local function inHeistNow()
@@ -258,39 +279,6 @@ end
 local function joinCriminalJob() startJobSession("Criminal") end
 local function joinDeliveryJob() startJobSession("Delivery") end
 
-local Delivery = { Enabled = false }
-local function deliveryInteract(loc)
-    if not Remotes or not loc then return end
-    pcall(function() Remotes.fireServer("DeliveryLocationInteracted", loc) end)
-end
-task.spawn(function()
-    while true do
-        task.wait(0.4)
-        if not Delivery.Enabled then continue end
-        local hrp = getHRP()
-        if not hrp then continue end
-        for _, loc in ipairs(CollectionService:GetTagged("DeliveryLocation")) do
-            local ok, pivot = pcall(function() return loc:GetPivot() end)
-            local pos = ok and pivot and pivot.Position
-                or (loc:IsA("BasePart") and loc.Position)
-            if pos then
-                local radius = loc:GetAttribute("TriggerDistance") or 25
-                if (hrp.Position - pos).Magnitude <= radius + 5 then
-                    deliveryInteract(loc)
-                end
-            end
-        end
-    end
-end)
-
-local HUNT_POSITIONS = {
-    Vector3.new(-2060, 15, 3415),
-    Vector3.new(-2846, 11, -1549),
-    Vector3.new(-1055, 12, 5048),
-    Vector3.new(-1893, 14, 2198),
-    Vector3.new(-300,  26, -654),
-}
-
 local function requestStreamAround(pos)
     task.spawn(function()
         pcall(function()
@@ -300,6 +288,1366 @@ local function requestStreamAround(pos)
         end)
     end)
     return true
+end
+
+--=====================================================================
+--  RoadNav
+--  Builds a road graph out of the LIVE game, every session.
+--  There are no hardcoded coordinates anywhere in here: if the devs
+--  move, add or delete roads, the graph just comes out different next
+--  time it is built. Road pieces keep their Model pivot even while
+--  streamed out, so the whole network is visible from anywhere on the
+--  map without waiting for geometry to load in.
+--=====================================================================
+local RoadNav = {
+    Nodes    = {},          -- { [i] = { p = Vector3, ax = Vector3 } }
+    Grid     = {},          -- "cx,cz" -> { node indices }
+    CellSize = 200,
+    Built    = false,
+    BuiltAt  = 0,
+    Sources  = 0,           -- how many containers we pulled from
+    Building = false,
+    SeenParts = setmetatable({}, { __mode = "k" }),
+    Generation = 0,         -- bumped on Build; node indices change with it
+    LastHarvest = 0,
+    HarvestRadius = 800,
+    HarvestEvery  = 3,      -- seconds between local part sweeps
+}
+
+-- A container counts as a road folder when its name ENDS in road/roads.
+-- Matches: "Roads", "New_Roads", "TEMP DEALERSHIP ROADS".
+-- Skips:   "OffroadingIsland", "OffRoadingPropsBoxes", "Railway".
+local function looksLikeRoadFolder(name)
+    return name:lower():match("roads?$") ~= nil
+end
+
+-- Whole containers that end in "roads" but are not through-roads. The
+-- dealership forecourt is the big one -- it is named "TEMP DEALERSHIP ROADS"
+-- and is a car park, so the graph used to route straight through it.
+local ROAD_CONTAINER_REJECT = {
+    "parking", "dealership", "lot", "yard", "plaza", "driveway", "garage",
+    "forecourt", "showroom",
+}
+
+-- Structure and scenery that lives inside the road folders but is not tarmac.
+local ROAD_NAME_REJECT = {
+    "rail", "support", "brace", "sign", "light", "pole", "fence", "barrier",
+    "guardrail", "lamp", "cone", "prop", "billboard", "bush", "tree", "rock",
+    "curb", "sidewalk", "wall", "lod", "line", "arrow", "marking", "decal",
+    "parking", "grass", "flag", "stop", "bench", "hydrant",
+}
+
+local function matchesAny(name, list)
+    local n = name:lower()
+    for _, bad in ipairs(list) do
+        if n:find(bad, 1, true) then return true end
+    end
+    return false
+end
+
+local function nameIsRejected(name)
+    return matchesAny(name, ROAD_NAME_REJECT)
+end
+
+local function containerIsRejected(name)
+    return matchesAny(name, ROAD_CONTAINER_REJECT)
+end
+
+local function flatUnit(v)
+    local f = Vector3.new(v.X, 0, v.Z)
+    if f.Magnitude < 1e-4 then return nil end
+    return f.Unit
+end
+
+-- Model:GetPivot() works on streamed-out models as long as WorldPivot was
+-- authored, which is the case for every road piece in this map.
+local function pivotOf(inst)
+    local ok, cf = pcall(function() return inst:GetPivot() end)
+    if not ok or typeof(cf) ~= "CFrame" then return nil end
+    local p = cf.Position
+    if p.Magnitude < 1 then return nil end              -- pivot never set
+    if p.Y < -500 or p.Y > 2000 then return nil end     -- underground / skybox junk
+    return cf
+end
+
+local function findRoadContainers()
+    local out, seen = {}, {}
+    local function consider(inst)
+        if seen[inst] then return end
+        if looksLikeRoadFolder(inst.Name) and not containerIsRejected(inst.Name) then
+            seen[inst] = true
+            table.insert(out, inst)
+        end
+    end
+
+    local roots = { Workspace }
+    local map = Workspace:FindFirstChild("Map")
+    if map then
+        table.insert(roots, map)
+        local inner = map:FindFirstChild("Map")   -- some builds nest Map.Map
+        if inner then table.insert(roots, inner) end
+    end
+
+    for _, root in ipairs(roots) do
+        for _, child in ipairs(root:GetChildren()) do
+            if child:IsA("Folder") or child:IsA("Model") then
+                consider(child)
+                -- one level deeper, for things like Map/House_Update/New_Roads
+                if child:IsA("Folder") and not looksLikeRoadFolder(child.Name) then
+                    for _, gchild in ipairs(child:GetChildren()) do
+                        if gchild:IsA("Folder") then consider(gchild) end
+                    end
+                end
+            end
+        end
+    end
+    return out
+end
+
+local function harvestNodes(container, nodes)
+    local function take(inst)
+        if nameIsRejected(inst.Name) then return end
+        local cf = pivotOf(inst)
+        if not cf then return end
+        -- Road pieces are laid out along their local X, so RightVector is the
+        -- direction of travel. Only used as a hint; routing works off geometry.
+        table.insert(nodes, { p = cf.Position, ax = flatUnit(cf.RightVector) })
+    end
+
+    for _, child in ipairs(container:GetChildren()) do
+        if child:IsA("Model") or child:IsA("BasePart") then
+            take(child)
+        elseif child:IsA("Folder") and not nameIsRejected(child.Name) then
+            for _, gchild in ipairs(child:GetChildren()) do
+                if gchild:IsA("Model") or gchild:IsA("BasePart") then take(gchild) end
+            end
+        end
+    end
+end
+
+local function gridKey(x, z)
+    return math.floor(x / RoadNav.CellSize) .. "," .. math.floor(z / RoadNav.CellSize)
+end
+
+function RoadNav.Build()
+    if RoadNav.Building then return RoadNav.Built end
+    RoadNav.Building = true
+
+    local nodes = {}
+    local containers = findRoadContainers()
+    for _, c in ipairs(containers) do
+        pcall(harvestNodes, c, nodes)
+    end
+
+    -- Last resort: anything the game tagged as a road.
+    if #nodes < 40 then
+        for _, tag in ipairs({ "Road", "RoadSegment", "RoadPiece" }) do
+            local ok, tagged = pcall(function() return CollectionService:GetTagged(tag) end)
+            if ok and tagged then
+                for _, inst in ipairs(tagged) do
+                    local cf = pivotOf(inst)
+                    if cf then table.insert(nodes, { p = cf.Position, ax = flatUnit(cf.RightVector) }) end
+                end
+            end
+        end
+    end
+
+    local grid = {}
+    for i, n in ipairs(nodes) do
+        local k = gridKey(n.p.X, n.p.Z)
+        local bucket = grid[k]
+        if not bucket then bucket = {}; grid[k] = bucket end
+        table.insert(bucket, i)
+    end
+
+    RoadNav.Nodes    = nodes
+    RoadNav.Grid     = grid
+    RoadNav.SeenParts = setmetatable({}, { __mode = "k" })
+    RoadNav.Generation = (RoadNav.Generation or 0) + 1
+    RoadNav.Sources  = #containers
+    RoadNav.Built    = #nodes >= 20
+    RoadNav.BuiltAt  = tick()
+    RoadNav.Building = false
+    return RoadNav.Built
+end
+
+-- Add one node and index it. Used by both harvest passes.
+function RoadNav.AddNode(pos, ax)
+    table.insert(RoadNav.Nodes, { p = pos, ax = ax })
+    local k = gridKey(pos.X, pos.Z)
+    local bucket = RoadNav.Grid[k]
+    if not bucket then bucket = {}; RoadNav.Grid[k] = bucket end
+    table.insert(bucket, #RoadNav.Nodes)
+end
+
+-- The model-pivot pass only sees folders named "...Roads", which misses whole
+-- districts -- the entire city road network lives in NewMapAdditions. Those
+-- roads are ordinary Asphalt parts, so sweep up whatever is streamed in around
+-- us and lay nodes along each one. Streamed-out parts are invisible here, which
+-- is fine: this only ever needs to cover the ground we are actually driving on,
+-- and the pivot pass still provides the long-range skeleton.
+function RoadNav.HarvestNearby(pos, radius, ignore)
+    if #RoadNav.Nodes > 60000 then return 0 end   -- long session guard
+    local op = OverlapParams.new()
+    op.FilterType = Enum.RaycastFilterType.Exclude
+    op.FilterDescendantsInstances = ignore or {}
+    op.MaxParts = 12000
+    local ok, parts = pcall(function()
+        return Workspace:GetPartBoundsInRadius(pos, radius or 800, op)
+    end)
+    if not ok or not parts then return 0 end
+
+    local added = 0
+    for _, part in ipairs(parts) do
+        if not RoadNav.SeenParts[part] then
+            local isRoad = part.Material == Enum.Material.Asphalt
+                or (part.Name:lower():find("road", 1, true) ~= nil
+                    and not nameIsRejected(part.Name))
+            if isRoad and part.Size.X >= 8 and part.Size.Z >= 8 then
+                RoadNav.SeenParts[part] = true
+                local sx, sz = part.Size.X, part.Size.Z
+                local long = math.max(sx, sz)
+                local axis = (sx >= sz) and part.CFrame.RightVector or part.CFrame.LookVector
+                local surfaceY = part.Position.Y + part.Size.Y / 2
+                local count = math.clamp(math.floor(long / 60), 1, 24)
+                local flatAx = flatUnit(axis)
+                for i = 1, count do
+                    -- spread the samples evenly down the middle of the slab
+                    local t = (count == 1) and 0 or ((i - 1) / (count - 1) - 0.5)
+                    local p = part.Position + axis * (long * t * 0.92)
+                    RoadNav.AddNode(Vector3.new(p.X, surfaceY, p.Z), flatAx)
+                    added = added + 1
+                end
+            end
+        end
+    end
+    return added
+end
+
+-- Every node index inside `radius` studs of pos (square-ish, grid based).
+function RoadNav.Query(pos, radius)
+    local out = {}
+    local span = math.ceil(radius / RoadNav.CellSize)
+    local cx = math.floor(pos.X / RoadNav.CellSize)
+    local cz = math.floor(pos.Z / RoadNav.CellSize)
+    for dx = -span, span do
+        for dz = -span, span do
+            local bucket = RoadNav.Grid[(cx + dx) .. "," .. (cz + dz)]
+            if bucket then
+                for _, i in ipairs(bucket) do table.insert(out, i) end
+            end
+        end
+    end
+    return out
+end
+
+function RoadNav.Nearest(pos, maxRadius)
+    local best, bestD
+    local radius = 250
+    while radius <= (maxRadius or 4000) do
+        for _, i in ipairs(RoadNav.Query(pos, radius)) do
+            local d = (RoadNav.Nodes[i].p - pos).Magnitude
+            if not bestD or d < bestD then best, bestD = i, d end
+        end
+        if best then return best, bestD end
+        radius = radius * 2
+    end
+    return nil
+end
+
+--=====================================================================
+--  Router
+--  Walks the graph forever without repeating itself much. Picks the
+--  neighbour that best continues the current heading, penalising nodes
+--  it visited recently so it keeps exploring instead of ping-ponging
+--  between two pieces of road.
+--=====================================================================
+local Router = {
+    Node      = nil,
+    Graph     = -1,       -- RoadNav.Generation these indices belong to
+    Heading   = Vector3.new(0, 0, -1),
+    Radius    = 450,      -- outermost look-ahead for the next node
+    MinStep   = 15,       -- ignore nodes basically on top of us
+    YTolerance = 18,      -- keeps us off overpasses stacked above/below
+
+    -- Nearest rung first, so we track the road piece by piece and only stride
+    -- across a gap when the graph really has one.
+    Ladder    = { 120, 200, 320, 450 },
+
+    -- How far off the current heading still counts as "the same road". Roads
+    -- bend, so this is deliberately generous: a run should survive a curve and
+    -- only end at a real junction or a dead end.
+    SameRoadCone = 0.80,      -- cos(37 deg)
+    BendCone     = 0.62,      -- cos(52 deg): a sharp bend is still one road
+
+    -- The sharpest turn we will take at a junction. Anything beyond this is a
+    -- U-turn, and we only ever do those when there is genuinely nothing else.
+    TurnCone     = -0.50,     -- cos(120 deg)
+
+    -- When a run ends we look ahead down each option and take whichever leads
+    -- onto the longest stretch of road.
+    Lookahead       = 16,
+    PotentialWeight = 0.05,
+    SpurPenalty     = 8.0,    -- heavy nudge away from short dead-end stubs
+    SpurLength      = 250,
+
+    VisitPenalty = 4.0,
+    -- 300 nodes was only ~100 seconds of memory at speed, after which the
+    -- router forgot its own tracks and could settle into a loop.
+    RecentMax = 4000,
+    Recent    = {},       -- ring buffer of indices
+    RecentAt  = 1,
+    Visits    = {},       -- index -> count still inside the ring buffer
+    Seen      = {},       -- index -> lifetime count, never forgotten
+    SeenPenalty = 0.6,    -- gentle, lasting bias towards roads we have not driven
+    SeenCap     = 8,
+
+    RunStuds  = 0,        -- length of the stretch we are currently driving
+    Validate  = nil,      -- optional (fromPos, toPos) -> bool road check
+    NoUTurn   = true,     -- refuse reversals; the driver clears this at a real dead end
+}
+
+-- Clears only the short-term ring. Router.Seen deliberately survives, so that
+-- re-anchoring after a coast or a teleport does not wipe the knowledge of which
+-- roads we have already driven.
+function Router.Forget()
+    Router.Recent = {}
+    Router.RecentAt = 1
+    Router.Visits = {}
+    Router.RunStuds = 0
+end
+
+local function markVisited(i)
+    local ring = Router.Recent
+    local slot = Router.RecentAt
+    local old = ring[slot]
+    if old then
+        Router.Visits[old] = (Router.Visits[old] or 1) - 1
+        if Router.Visits[old] <= 0 then Router.Visits[old] = nil end
+    end
+    ring[slot] = i
+    Router.Visits[i] = (Router.Visits[i] or 0) + 1
+    Router.Seen[i] = math.min((Router.Seen[i] or 0) + 1, Router.SeenCap)
+    Router.RecentAt = (slot % Router.RecentMax) + 1
+end
+
+-- Anchor the router at whatever node is closest to `pos`, heading `dir`.
+function Router.Reset(pos, dir)
+    if not RoadNav.Built then return false end
+    -- A rebuilt graph renumbers everything, so the lifetime counts no longer
+    -- refer to the roads we think they do.
+    if Router.Graph ~= RoadNav.Generation then
+        Router.Seen = {}
+        Router.Graph = RoadNav.Generation
+    end
+    local i = RoadNav.Nearest(pos)
+    if not i then return false end
+    Router.Node = i
+    Router.Heading = flatUnit(dir or Vector3.new(0, 0, -1)) or Vector3.new(0, 0, -1)
+    Router.Forget()
+    markVisited(i)
+    return true
+end
+
+-- Every node within `radius` of `from` that sits at least `cone` off `heading`.
+-- Returns an array of { index, dir, dist }.
+function Router.Neighbours(fromIdx, radius, cone, heading, skip)
+    local here = RoadNav.Nodes[fromIdx]
+    local out = {}
+    if not here then return out end
+    for _, j in ipairs(RoadNav.Query(here.p, radius)) do
+        if j ~= fromIdx and not (skip and skip[j]) then
+            local n = RoadNav.Nodes[j]
+            if math.abs(n.p.Y - here.p.Y) <= Router.YTolerance then
+                local delta = n.p - here.p
+                local dist = Vector3.new(delta.X, 0, delta.Z).Magnitude
+                if dist >= Router.MinStep and dist <= radius then
+                    local dir = flatUnit(delta)
+                    if dir and (not heading or heading:Dot(dir) >= cone) then
+                        table.insert(out, { index = j, dir = dir, dist = dist })
+                    end
+                end
+            end
+        end
+    end
+    return out
+end
+
+-- Carry on down the road we are already on. No visit penalty here on purpose:
+-- once we commit to a stretch we drive it to the end rather than turning off
+-- halfway because we have been down it before.
+function Router.ContinueRun(fromIdx, heading, skip)
+    -- Straight-on first; then one wider sweep, because a sharp bend in a road
+    -- is still the same road and ending the run there was costing us a whole
+    -- junction decision (and sometimes a U-turn) mid-highway.
+    for _, cone in ipairs({ Router.SameRoadCone, Router.BendCone }) do
+        for _, radius in ipairs(Router.Ladder) do
+            local best, bestScore
+            for _, c in ipairs(Router.Neighbours(fromIdx, radius, cone, heading, skip)) do
+                local score = heading:Dot(c.dir) * 4.0 - (c.dist / radius) * 0.3
+                if not bestScore or score > bestScore then best, bestScore = c, score end
+            end
+            if best then return best end
+        end
+    end
+    return nil
+end
+
+-- Rough length of road available if we head off in this direction.
+function Router.RunPotential(fromIdx, heading)
+    local cur, head, total = fromIdx, heading, 0
+    for _ = 1, Router.Lookahead do
+        local step = Router.ContinueRun(cur, head)
+        if not step then break end
+        total = total + step.dist
+        head = flatUnit(step.dir * 0.7 + head * 0.3) or step.dir
+        cur = step.index
+    end
+    return total
+end
+
+-- The road ran out. Pick the turn that opens onto the longest new stretch.
+function Router.PickTurn(fromIdx, heading, skip)
+    for _, radius in ipairs(Router.Ladder) do
+        local best, bestScore
+        for _, c in ipairs(Router.Neighbours(fromIdx, radius, Router.TurnCone, heading, skip)) do
+            local potential = Router.RunPotential(c.index, c.dir)
+            local score = potential * Router.PotentialWeight
+                + heading:Dot(c.dir) * 1.5
+                - (Router.Visits[c.index] or 0) * Router.VisitPenalty
+                - (Router.Seen[c.index] or 0) * Router.SeenPenalty
+                - (c.dist / radius) * 0.3
+                + math.random() * 0.05
+            if potential < Router.SpurLength then
+                score = score - Router.SpurPenalty
+            end
+            if not bestScore or score > bestScore then best, bestScore = c, score end
+        end
+        if best then return best end
+    end
+    return nil
+end
+
+-- Returns the next node index, or nil when the graph has nothing to offer.
+function Router.Next()
+    if not Router.Node then return nil end
+    local here = RoadNav.Nodes[Router.Node]
+    if not here then return nil end
+
+    local skip = nil
+    local choice, turned
+    local firstChoice, firstTurned   -- best guess before the road check vetoed it
+
+    -- Up to a few goes, in case the road check rejects a leg that would have
+    -- taken us through a building.
+    for _ = 1, 3 do
+        turned = false
+        choice = Router.ContinueRun(Router.Node, Router.Heading, skip)
+        if not choice then
+            choice = Router.PickTurn(Router.Node, Router.Heading, skip)
+            turned = true
+        end
+        if not choice then break end
+        if not firstChoice then firstChoice, firstTurned = choice, turned end
+        if not Router.Validate then break end
+        if Router.Validate(here.p, RoadNav.Nodes[choice.index].p) then break end
+        skip = skip or {}
+        skip[choice.index] = true
+        choice = nil
+    end
+
+    -- The road check is advisory. If it vetoed everything we still had real
+    -- road ahead, so carry on down it -- turning the car round because a
+    -- raycast was unconvinced is far worse than driving a slightly odd leg.
+    if not choice and firstChoice then
+        choice, turned = firstChoice, firstTurned
+    end
+
+    -- Genuine dead end: this is the only place a U-turn can happen.
+    if not choice then
+        local fallback = Router.Neighbours(Router.Node, Router.Radius * 1.6, -1.0, nil, nil)
+        if #fallback == 0 then
+            -- Last resort, allow a change of level (ramp on/off an overpass).
+            local savedY = Router.YTolerance
+            Router.YTolerance = 400
+            fallback = Router.Neighbours(Router.Node, Router.Radius * 2, -1.0, nil, nil)
+            Router.YTolerance = savedY
+        end
+        local best, bestDist
+        for _, c in ipairs(fallback) do
+            if not bestDist or c.dist < bestDist then best, bestDist = c, c.dist end
+        end
+        if not best then return nil end
+        -- Running out of graph usually means the map simply has not streamed in
+        -- yet, not that the road ended. Turning round is the wrong answer to
+        -- that, so refuse and let the caller coast straight while it loads.
+        if Router.NoUTurn and Router.Heading:Dot(best.dir) < -0.35 then
+            return nil
+        end
+        choice, turned = best, true
+    end
+
+    if turned then
+        Router.RunStuds = choice.dist
+    else
+        Router.RunStuds = Router.RunStuds + choice.dist
+    end
+
+    -- Ease the heading round so corners are taken as a curve, not a snap.
+    Router.Heading = flatUnit(choice.dir * 0.7 + Router.Heading * 0.3) or choice.dir
+    Router.Node = choice.index
+    markVisited(choice.index)
+    return choice.index
+end
+
+--=====================================================================
+--  Vehicle helpers
+--=====================================================================
+local function getDrivenVehicleModel()
+    local hum = getHumanoid()
+    local seat = hum and hum.SeatPart
+    if not seat or not seat:IsA("VehicleSeat") then return nil, nil end
+
+    local current = seat
+    while current do
+        if current:IsA("Model") and current:FindFirstChild("Core") then
+            return current, seat
+        end
+        current = current.Parent
+    end
+
+    local model = seat:FindFirstAncestorOfClass("Model")
+    return model, seat
+end
+
+local function getWeightPart(model)
+    if not model then return nil end
+    return model:FindFirstChild("Weight")
+        or model:FindFirstChild("WeightPart")
+        or model.PrimaryPart
+end
+
+local function getVehicleId(model)
+    if not model then return nil end
+    local fromAttr = model:GetAttribute("VehicleId")
+    if fromAttr then return fromAttr end
+    local vo = model:FindFirstChild("VehicleObject")
+    if vo and vo:IsA("ObjectValue") and vo.Value then
+        return vo.Value.Name
+    end
+    return nil
+end
+
+local function killMomentum(model)
+    local wp = getWeightPart(model)
+    if wp then
+        pcall(function()
+            wp.AssemblyLinearVelocity = Vector3.zero
+            wp.AssemblyAngularVelocity = Vector3.zero
+        end)
+    end
+end
+
+-- Each wheel hangs off the chassis on its own suspension, so it is a separate
+-- physics assembly. Setting the velocity on the chassis alone leaves the four
+-- wheels behind, the suspension constraints snap them back, and the rims jitter.
+-- Cache every assembly root once per vehicle so we can move them together.
+local _assemblyCache = setmetatable({}, { __mode = "k" })
+
+local function getAssemblyRoots(model)
+    local cached = _assemblyCache[model]
+    if cached then return cached end
+    local roots, seen = {}, {}
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("BasePart") then
+            local ok, root = pcall(function() return d.AssemblyRootPart end)
+            if ok and root and not seen[root] then
+                seen[root] = true
+                table.insert(roots, root)
+            end
+        end
+    end
+    _assemblyCache[model] = roots
+    return roots
+end
+
+-- The game works out driving pay from how fast the vehicle reports it is
+-- going, not from where it has been. A car that is teleported with zero
+-- velocity reads as parked and earns nothing, so publish a real speed that
+-- matches the distance we are actually covering -- on every assembly, so the
+-- wheels travel with the body instead of fighting it.
+local function reportDrivingVelocity(model, dir, studsPerSecond)
+    if not dir then return end
+    local vel = Vector3.new(dir.X * studsPerSecond, 0, dir.Z * studsPerSecond)
+    local roots = getAssemblyRoots(model)
+    if #roots == 0 then
+        local wp = getWeightPart(model)
+        if wp then roots = { wp } end
+    end
+    for _, root in ipairs(roots) do
+        if root.Parent then
+            pcall(function()
+                root.AssemblyLinearVelocity = vel
+                root.AssemblyAngularVelocity = Vector3.zero
+            end)
+        end
+    end
+end
+
+local function raycastDown(pos, model, upOffset, dist)
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    local filter = { model }
+    if LocalPlayer.Character then table.insert(filter, LocalPlayer.Character) end
+    -- Other people's cars sit on the road and are not road. Without this a
+    -- parked stranger reads as "no tarmac here" and the router turns away.
+    for _, folderName in ipairs({ "Vehicles", "ClientVehicles", "Bots", "NPCs" }) do
+        local f = Workspace:FindFirstChild(folderName)
+        if f then table.insert(filter, f) end
+    end
+    rp.FilterDescendantsInstances = filter
+    rp.IgnoreWater = true
+    local from = pos + Vector3.new(0, upOffset or 5, 0)
+    return Workspace:Raycast(from, Vector3.new(0, -(dist or 500), 0), rp)
+end
+
+-- Is what we just hit something a car belongs on? Material first (the main
+-- roads are Asphalt), then a name check up the ancestry for everything else.
+local DRIVABLE_MATERIALS = {
+    [Enum.Material.Asphalt] = true,
+    [Enum.Material.Concrete] = true,
+    [Enum.Material.Cobblestone] = true,
+    [Enum.Material.Pavement] = true,
+    [Enum.Material.Metal] = true,      -- bridge decks
+    [Enum.Material.DiamondPlate] = true,
+}
+
+local function isDrivableSurface(hit)
+    if not hit or not hit.Instance then return false end
+    if DRIVABLE_MATERIALS[hit.Instance.Material] then return true end
+    local node, depth = hit.Instance, 0
+    while node and node ~= Workspace and depth < 4 do
+        local n = node.Name:lower()
+        if n:find("road", 1, true) or n:find("street", 1, true)
+            or n:find("bridge", 1, true) or n:find("asphalt", 1, true)
+            or n:find("i-10", 1, true) or n:find("route", 1, true) then
+            return true
+        end
+        node = node.Parent
+        depth = depth + 1
+    end
+    return false
+end
+
+-- Look straight down, then step sideways until we find tarmac. Returns the
+-- lateral offset that lands on road, plus the hit we should ride on.
+
+-- Sweep across the road and work out where the lane is.
+--
+-- Nodes sit at the CENTRE of a road slab, and a slab is usually the whole
+-- carriageway, so following nodes literally puts the car astride the middle
+-- line. This measures the drivable span we are standing in and returns the
+-- offset that would put us in the right-hand lane instead, along with a hit
+-- on the surface there.
+local LANE_SCAN_HALF = 78    -- how far either side to look, studs
+local LANE_SCAN_STEP = 6
+
+local function findLane(model, pos, right, laneHalfWidth, maxOffset)
+    local n = math.floor(LANE_SCAN_HALF / LANE_SCAN_STEP)
+    local drivable, hits = {}, {}
+    for i = -n, n do
+        local off = i * LANE_SCAN_STEP
+        local hit = raycastDown(pos + right * off, model, 40, 220)
+        drivable[i] = isDrivableSurface(hit)
+        hits[i] = hit
+    end
+
+    -- the contiguous drivable run we are in, or the nearest one
+    local start
+    if drivable[0] then
+        start = 0
+    else
+        for d = 1, n do
+            if drivable[-d] then start = -d break end
+            if drivable[d] then start = d break end
+        end
+    end
+    if not start then return nil, hits[0] end
+
+    local lo, hi = start, start
+    while lo - 1 >= -n and drivable[lo - 1] do lo = lo - 1 end
+    while hi + 1 <= n and drivable[hi + 1] do hi = hi + 1 end
+
+    local leftEdge  = lo * LANE_SCAN_STEP
+    local rightEdge = hi * LANE_SCAN_STEP
+    local width = rightEdge - leftEdge
+
+    local centre = (leftEdge + rightEdge) * 0.5
+    local target
+    if width <= laneHalfWidth * 2.2 then
+        target = centre                                -- single lane: sit in it
+    else
+        -- Keep right, but never wander more than a carriageway from the node
+        -- line. On a divided road the sweep sees the far side as drivable too
+        -- and would otherwise aim us across the median into oncoming lanes.
+        target = math.clamp(rightEdge - laneHalfWidth,
+                            math.min(centre, 0),
+                            maxOffset or 28)
+    end
+
+    local idx = math.clamp(math.floor(target / LANE_SCAN_STEP + 0.5), -n, n)
+    return target, hits[idx] or hits[0], width
+end
+
+-- Sample along a proposed leg and ask whether there is actually road under it.
+-- Streaming means far-away legs report nothing at all, and "nothing" must not
+-- count against a leg -- we only reject when we can see solid non-road there,
+-- which is what cutting the corner of a building looks like.
+local function legLooksDrivable(model, a, b)
+    local good, bad = 0, 0
+    for i = 1, 4 do
+        local hit = raycastDown(a:Lerp(b, i / 5), model, 60, 300)
+        if hit then
+            if isDrivableSurface(hit) then good = good + 1 else bad = bad + 1 end
+        end
+    end
+    if bad == 0 then return true end
+    if good == 0 and bad >= 3 then return false end
+    return good >= bad
+end
+
+-- Catmull-Rom through four consecutive road nodes, so bends are driven as a
+-- curve instead of a chord across the corner.
+local function catmullRom(p0, p1, p2, p3, t)
+    local t2 = t * t
+    local t3 = t2 * t
+    return (p1 * 2
+        + (p2 - p0) * t
+        + (p0 * 2 - p1 * 5 + p2 * 4 - p3) * t2
+        + (p1 * 3 - p0 - p2 * 3 + p3) * t3) * 0.5
+end
+
+local function teleportEntity(pos, yOff)
+    yOff = yOff or 5
+    local model = getDrivenVehicleModel()
+    if model then
+        local ok, pivot = pcall(function() return model:GetPivot() end)
+        local rot = ok and pivot and (pivot - pivot.Position) or CFrame.identity
+        pcall(function()
+            model:PivotTo(rot + (pos + Vector3.new(0, yOff, 0)))
+        end)
+        killMomentum(model)
+        return true
+    end
+    local hrp = getHRP()
+    if hrp then hrp.CFrame = CFrame.new(pos + Vector3.new(0, yOff, 0)) end
+    return false
+end
+
+--=====================================================================
+--  Car spawning
+--  The spawn pad is no longer a hardcoded CFrame -- the car is spawned
+--  wherever you are standing, facing down the nearest road.
+--=====================================================================
+local VEHICLE_REMOTE_PATH = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("VehicleEvent")
+local CAR_SPAWN_WAIT      = 3.2
+
+-- Leave empty to auto-detect from what you own.
+local MANUAL_BEST_CAR = ""
+
+local GOOD_CARS_PRIORITY = {
+    "Bugatti La Voiture Noire",
+    "Koenigsegg Jesko",
+    "Bugatti Chiron",
+    "Rimac Nevera",
+    "Pininfarina Battista",
+    "Nissan-GTR2017",
+}
+
+-- Ask the game itself what you own. VehicleUtil is the module the dealership
+-- and inventory UIs use, so this stays correct no matter how the save data is
+-- laid out. Note these are vehicle IDs, not showroom display names.
+local function listOwnedVehicleIds()
+    local ids = {}
+    local seen = {}
+    local function add(v)
+        if type(v) == "string" and v ~= "" and not seen[v] then
+            seen[v] = true
+            table.insert(ids, v)
+        end
+    end
+
+    if VehicleUtil and VehicleUtil.getActiveOwnedVehicles then
+        local ok, owned = pcall(VehicleUtil.getActiveOwnedVehicles, LocalPlayer)
+        if ok and type(owned) == "table" then
+            for _, v in ipairs(owned) do add(v) end
+        end
+    end
+
+    if #ids == 0 and VehicleData and VehicleData.GetOwnedVehicleIds then
+        local ok, owned = pcall(VehicleData.GetOwnedVehicleIds, LocalPlayer)
+        if ok and type(owned) == "table" then
+            for k, v in pairs(owned) do
+                add(type(v) == "string" and v or k)
+            end
+        end
+    end
+
+    -- Last resort: the replicated stats folder keeps one child per owned car.
+    if #ids == 0 and PlayerData and PlayerData.GetStatsFolderIfLoaded then
+        local ok, stats = pcall(PlayerData.GetStatsFolderIfLoaded, LocalPlayer)
+        if ok and stats then
+            local veh = stats:FindFirstChild("Vehicles")
+            if veh then
+                for _, child in ipairs(veh:GetChildren()) do add(child.Name) end
+            end
+        end
+    end
+
+    return ids
+end
+
+local function GetBestOwnedCar()
+    if MANUAL_BEST_CAR and MANUAL_BEST_CAR ~= "" then
+        return MANUAL_BEST_CAR
+    end
+
+    local owned = listOwnedVehicleIds()
+    local ownedSet = {}
+    for _, v in ipairs(owned) do ownedSet[v] = true end
+
+    for _, carName in ipairs(GOOD_CARS_PRIORITY) do
+        if ownedSet[carName] then return carName end
+    end
+
+    -- Whatever you drove last is almost always the one you want.
+    if VehicleUtil and VehicleUtil.getLastVehicleSpawned then
+        local ok, last = pcall(VehicleUtil.getLastVehicleSpawned, LocalPlayer, "Generic")
+        if ok and type(last) == "string" and last ~= "" then return last end
+    end
+
+    return owned[1]
+end
+
+-- Spawned cars live in Workspace.Vehicles under a model named after their
+-- OWNER, with the vehicle id in a CarType StringValue. Matching the car name
+-- against the model name therefore never hits, and the old fallback -- nearest
+-- unoccupied car -- happily picked whatever stranger had parked next to you.
+local function findNearbyVehicle(maxDist, targetCarName)
+    local function usable(model)
+        if not model or not model:IsA("Model") then return nil end
+        if model == LocalPlayer.Character then return nil end
+        if not model:FindFirstChild("Core") then return nil end
+        local seat = model:FindFirstChildOfClass("VehicleSeat") or model:FindFirstChildOfClass("Seat")
+        return seat and model or nil
+    end
+
+    -- 1. The one named after us. This is our car, full stop.
+    for _, folderName in ipairs({ "Vehicles", "ClientVehicles", "Cars", "SpawnedCars" }) do
+        local folder = Workspace:FindFirstChild(folderName)
+        local mine = folder and folder:FindFirstChild(LocalPlayer.Name)
+        if usable(mine) then return mine end
+    end
+
+    -- 2. Otherwise something whose CarType is the model we asked for, as long
+    --    as it is not named after another player in the server.
+    local hrp = getHRP()
+    local playerPos = hrp and hrp.Position
+    local byType, byTypeDist
+    local anyFree, anyFreeDist
+    for _, folderName in ipairs({ "Vehicles", "ClientVehicles", "Cars", "SpawnedCars" }) do
+        local folder = Workspace:FindFirstChild(folderName)
+        if folder then
+            for _, model in ipairs(folder:GetChildren()) do
+                if usable(model) and not Players:FindFirstChild(model.Name) then
+                    local dist = playerPos and (model:GetPivot().Position - playerPos).Magnitude or 0
+                    if dist <= (maxDist or 300) then
+                        local carType = model:FindFirstChild("CarType")
+                        local isTarget = targetCarName and carType and carType.Value
+                            and string.lower(tostring(carType.Value)) == string.lower(targetCarName)
+                        if isTarget and (not byTypeDist or dist < byTypeDist) then
+                            byType, byTypeDist = model, dist
+                        end
+                        local seat = model:FindFirstChildOfClass("VehicleSeat")
+                        if seat and not seat.Occupant and (not anyFreeDist or dist < anyFreeDist) then
+                            anyFree, anyFreeDist = model, dist
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return byType or anyFree
+end
+
+-- Spawns your best car at your current spot, pointing along the road.
+local function ensureCarSpawnedAndEntered()
+    if getDrivenVehicleModel() then return true end
+
+    local hrp = getHRP()
+    if not hrp then
+        warn("[DE][Drive] no HumanoidRootPart")
+        return false
+    end
+
+    local carName = GetBestOwnedCar()
+    if not carName then
+        warn("[DE][Drive] no owned vehicle found. Hit 'Refresh Vehicle List' on the")
+        warn("[DE][Drive] Car tab -- it prints every id it can see -- then pick one")
+        warn("[DE][Drive] from the dropdown. Spawning one car by hand once also works.")
+        return false
+    end
+
+    -- Stand on the nearest road first so the car lands on tarmac instead of
+    -- wherever you happened to be. Orientation is irrelevant: AutoDrive
+    -- re-aims the car on its first frame.
+    if RoadNav.Built then
+        local i = RoadNav.Nearest(hrp.Position)
+        if i then
+            local n = RoadNav.Nodes[i]
+            local facing = n.ax or hrp.CFrame.LookVector
+            hrp.CFrame = CFrame.lookAt(n.p + Vector3.new(0, 6, 0), n.p + Vector3.new(0, 6, 0) + facing)
+            task.wait(0.4)
+        end
+    end
+
+    pcall(function()
+        VEHICLE_REMOTE_PATH:FireServer("Spawn", carName)
+    end)
+
+    local car
+    local deadline = tick() + CAR_SPAWN_WAIT + 10
+    while tick() < deadline and not car do
+        car = findNearbyVehicle(260, carName)
+        if not car then task.wait(0.4) end
+    end
+    if not car then
+        warn("[DE][Drive] no vehicle appeared after Spawn -- is the car name right?")
+        return false
+    end
+
+    local seat = car:FindFirstChildOfClass("VehicleSeat") or car:FindFirstChildOfClass("Seat")
+    local hum = getHumanoid()
+    if seat and hum then
+        -- Sit only takes at close range, and the car does not spawn on top of us.
+        local h = getHRP()
+        if h then
+            h.CFrame = car:GetPivot() * CFrame.new(0, 5, 8)
+            task.wait(0.5)
+        end
+        pcall(function() seat:Sit(hum) end)
+        task.wait(1.0)
+        if not (hum.SeatPart == seat) and h then
+            h.CFrame = seat.CFrame
+            task.wait(0.4)
+            pcall(function() seat:Sit(hum) end)
+            task.wait(0.6)
+        end
+    end
+    return getDrivenVehicleModel() ~= nil
+end
+
+--=====================================================================
+--  AutoDrive
+--  Flies the car along the road graph. Speed is in studs per SECOND and
+--  is frame-rate independent, so a 240Hz client drives at the same pace
+--  as a 60Hz one.
+--=====================================================================
+local AutoDrive = {
+    Enabled     = false,
+    Speed       = 430,      -- studs/second
+    -- Ride height must stay at or below 1. Any higher and the game stops
+    -- counting the car as driving, so the run earns nothing.
+    Hover       = 0.8,
+    HoverMax    = 1,
+    Status      = "idle",
+    Distance    = 0,        -- studs driven since the toggle went on
+    -- The periodic full rebuild used to run every 3 minutes. It threw away
+    -- every locally harvested node (measured: 2532 -> 1509) and renumbered the
+    -- rest, so the router's memory of where it had been became meaningless and
+    -- it started going round in circles. The local harvest keeps the graph
+    -- fresh on its own; use the Rebuild button if the map really changes.
+    RebuildEvery = 0,
+    AutoRespawn = true,     -- put you back in a car if you lose it
+    HugRoad     = true,     -- find the lane instead of tracking the centreline
+    CheckLegs   = true,     -- reject legs that cut across non-road
+    LaneHalfWidth = 12,     -- half a lane; road generator uses ~24 stud lanes
+    LaneMaxOffset = 28,     -- never sit further than this from the node line
+    LaneScanEvery = 0.2,    -- seconds between lane sweeps
+    LaneEase      = 0.12,   -- how fast to slide across into the lane
+    LaneTarget    = 0,
+    LaneAt        = 0,
+    RoadWidth     = 0,
+    SmoothY       = nil,
+    Up            = nil,
+    Coasting      = false,  -- holding a heading while the map streams in
+    Coasted       = 0,      -- studs coasted since we last had real road
+    CoastStep     = 110,    -- length of each synthetic straight-ahead hop
+    MaxCoast      = 2600,   -- past this it is a genuine dead end, not streaming
+    StreamAt      = 0,
+    Path        = {},       -- upcoming node positions; needs 4 for the curve
+    T           = 0,
+    Dir         = Vector3.new(0, 0, -1),
+    Lateral     = 0,        -- current sideways correction, eased
+    LastRebuild = 0,
+    Respawning  = false,
+}
+
+local function autoDriveStop(reason)
+    AutoDrive.Enabled = false
+    AutoDrive.Status = reason or "stopped"
+end
+
+-- Keep at least four nodes queued so the curve always has its control points.
+local function fillPath()
+    local guard = 0
+    while #AutoDrive.Path < 4 and guard < 12 do
+        guard = guard + 1
+        local nextIdx = Router.Next()
+
+        if nextIdx then
+            table.insert(AutoDrive.Path, RoadNav.Nodes[nextIdx].p)
+            AutoDrive.Coasted = 0
+            AutoDrive.Coasting = false
+
+        elseif AutoDrive.Coasted < AutoDrive.MaxCoast then
+            -- No graph ahead. Almost always this is the map not having streamed
+            -- in yet rather than the road ending, so hold the current heading,
+            -- pull the terrain in, and pick the road back up on the far side.
+            local last = AutoDrive.Path[#AutoDrive.Path]
+            if not last then return false end
+            local p = last + AutoDrive.Dir * AutoDrive.CoastStep
+            table.insert(AutoDrive.Path, p)
+            AutoDrive.Coasted = AutoDrive.Coasted + AutoDrive.CoastStep
+            AutoDrive.Coasting = true
+            requestStreamAround(p)
+            RoadNav.HarvestNearby(p, RoadNav.HarvestRadius, { LocalPlayer.Character })
+            -- If anything has appeared near the coast point, re-join the road.
+            local found = RoadNav.Nearest(p, 260)
+            if found then
+                Router.Reset(RoadNav.Nodes[found].p, AutoDrive.Dir)
+                AutoDrive.Coasted = 0
+                AutoDrive.Coasting = false
+            end
+
+        else
+            -- Coasted a long way with nothing at all: this really is the end of
+            -- the road (map edge, cul-de-sac). Now a turn is the right answer.
+            Router.NoUTurn = false
+            local turnIdx = Router.Next()
+            Router.NoUTurn = true
+            if not turnIdx then return false end
+            table.insert(AutoDrive.Path, RoadNav.Nodes[turnIdx].p)
+            AutoDrive.Coasted = 0
+            AutoDrive.Coasting = false
+        end
+    end
+    return #AutoDrive.Path >= 4
+end
+
+local function resetPath(fromPos)
+    -- Path[2] must be where the car already is, otherwise the first frame
+    -- jumps it to the first node. Path[1] is only a curve control point.
+    local back = fromPos - (AutoDrive.Dir or Vector3.new(0, 0, -1)) * 20
+    AutoDrive.Path = { back, fromPos }
+    AutoDrive.T = 0
+    AutoDrive.Lateral = 0
+    if not fillPath() then return false end
+    requestStreamAround(AutoDrive.Path[3])
+    return true
+end
+
+-- Step onto the next segment of the queued path.
+local function advancePath()
+    table.remove(AutoDrive.Path, 1)
+    AutoDrive.T = 0
+    if not fillPath() then return false end
+    requestStreamAround(AutoDrive.Path[#AutoDrive.Path])
+    return true
+end
+
+local function autoDriveStart()
+    if not RoadNav.Built then
+        AutoDrive.Status = "building road graph"
+        RoadNav.Build()
+    end
+    if not RoadNav.Built then
+        notify("Auto Drive", ("Found only %d road nodes -- graph too small."):format(#RoadNav.Nodes), 5, "error")
+        return false
+    end
+
+    local model = getDrivenVehicleModel()
+    if not model and AutoDrive.AutoRespawn then
+        AutoDrive.Status = "spawning car"
+        notify("Auto Drive", "Spawning your car...", 3, "info")
+        pcall(ensureCarSpawnedAndEntered)
+        model = getDrivenVehicleModel()
+    end
+    if not model then
+        notify("Auto Drive", "Sit in a car first.", 5, "warning")
+        return false
+    end
+
+    local pivot = model:GetPivot()
+
+    -- Seed dense local coverage before anchoring, or the router starts on the
+    -- sparse skeleton and immediately dead-ends.
+    RoadNav.HarvestNearby(pivot.Position, RoadNav.HarvestRadius,
+        { model, LocalPlayer.Character })
+    RoadNav.LastHarvest = tick()
+
+    if not Router.Reset(pivot.Position, pivot.LookVector) then
+        notify("Auto Drive", "No road found near you.", 5, "error")
+        return false
+    end
+
+    AutoDrive.Distance = 0
+    AutoDrive.Dir = flatUnit(pivot.LookVector) or Vector3.new(0, 0, -1)
+    AutoDrive.SmoothY, AutoDrive.Up = nil, nil
+    AutoDrive.Lateral, AutoDrive.LaneTarget, AutoDrive.LaneAt = 0, 0, 0
+    AutoDrive.Coasted, AutoDrive.Coasting = 0, false
+    Router.NoUTurn = true
+
+    -- Let the router reject legs that do not have road under them.
+    Router.Validate = function(fromPos, toPos)
+        if not AutoDrive.CheckLegs then return true end
+        local m = getDrivenVehicleModel()
+        if not m then return true end
+        return legLooksDrivable(m, fromPos, toPos)
+    end
+
+    if not resetPath(pivot.Position) then
+        notify("Auto Drive", "Road graph is a dead end here.", 5, "error")
+        return false
+    end
+    AutoDrive.LastRebuild = tick()
+    AutoDrive.Status = "driving"
+    return true
+end
+
+task.spawn(function()
+    while alive() do
+        local dt = RunService.Heartbeat:Wait()
+        if not AutoDrive.Enabled then continue end
+
+        local model = getDrivenVehicleModel()
+        if not model then
+            AutoDrive.Status = "no vehicle"
+            if AutoDrive.AutoRespawn and not AutoDrive.Respawning then
+                AutoDrive.Respawning = true
+                task.spawn(function()
+                    local ok = pcall(ensureCarSpawnedAndEntered)
+                    if ok and getDrivenVehicleModel() then
+                        local p = getDrivenVehicleModel():GetPivot()
+                        Router.Reset(p.Position, p.LookVector)
+                        resetPath(p.Position)
+                        AutoDrive.Status = "driving"
+                    end
+                    AutoDrive.Respawning = false
+                end)
+            end
+            continue
+        end
+
+        -- At 300 studs/s the car outruns Roblox's streaming, arrives somewhere
+        -- with no geometry and no nodes, and used to turn round. Ask for the
+        -- ground well ahead of where we actually are.
+        if tick() - AutoDrive.StreamAt > 0.75 then
+            AutoDrive.StreamAt = tick()
+            local ahead = model:GetPivot().Position + AutoDrive.Dir * 1000
+            requestStreamAround(ahead)
+        end
+
+        -- Keep laying nodes on the tarmac around us as it streams in. This is
+        -- what stops the router running out of road and turning back.
+        if tick() - RoadNav.LastHarvest > RoadNav.HarvestEvery then
+            RoadNav.LastHarvest = tick()
+            local anchor = model:GetPivot().Position
+            task.spawn(function()
+                RoadNav.HarvestNearby(anchor, RoadNav.HarvestRadius,
+                    { model, LocalPlayer.Character })
+            end)
+        end
+
+        -- Periodic refresh so roads added or moved mid-session get picked up.
+        if AutoDrive.RebuildEvery > 0 and tick() - AutoDrive.LastRebuild > AutoDrive.RebuildEvery then
+            AutoDrive.LastRebuild = tick()
+            task.spawn(function()
+                local before = #RoadNav.Nodes
+                RoadNav.Build()
+                if #RoadNav.Nodes ~= before then
+                    local p = model:GetPivot()
+                    Router.Reset(p.Position, AutoDrive.Dir)
+                    resetPath(p.Position)
+                end
+            end)
+        end
+
+        if #AutoDrive.Path < 4 then
+            local p = model:GetPivot()
+            if not fillPath() then
+                Router.Reset(p.Position, AutoDrive.Dir)
+                if not resetPath(p.Position) then
+                    autoDriveStop("graph dead end")
+                end
+            end
+            continue
+        end
+
+        local p0, p1, p2, p3 = AutoDrive.Path[1], AutoDrive.Path[2], AutoDrive.Path[3], AutoDrive.Path[4]
+        local segLen = (p2 - p1).Magnitude
+        if segLen < 1 then
+            if not advancePath() then autoDriveStop("graph dead end") end
+            continue
+        end
+
+        local step = AutoDrive.Speed * math.min(dt, 0.1)
+        AutoDrive.T = AutoDrive.T + step / segLen
+        AutoDrive.Distance = AutoDrive.Distance + step
+
+        if AutoDrive.T >= 1 then
+            -- Carry on from the node we just reached; never teleport back to a
+            -- start point, which is what made the old fixed loop obvious.
+            if not advancePath() then
+                local here = p2
+                Router.Reset(here, AutoDrive.Dir)
+                if not resetPath(here) then
+                    autoDriveStop("graph dead end")
+                    continue
+                end
+            end
+            p0, p1, p2, p3 = AutoDrive.Path[1], AutoDrive.Path[2], AutoDrive.Path[3], AutoDrive.Path[4]
+        end
+
+        -- Curve through the node chain rather than cutting the corner.
+        local t = math.clamp(AutoDrive.T, 0, 1)
+        local pos = catmullRom(p0, p1, p2, p3, t)
+
+        local want = flatUnit(catmullRom(p0, p1, p2, p3, math.min(t + 0.06, 1)) - pos)
+            or flatUnit(p2 - p1)
+        if want then
+            AutoDrive.Dir = flatUnit(AutoDrive.Dir:Lerp(want, 0.18)) or want
+        end
+        local right = AutoDrive.Dir:Cross(Vector3.new(0, 1, 0))
+        right = (right.Magnitude > 1e-3) and right.Unit or Vector3.new(1, 0, 0)
+
+        -- Find the tarmac. If the spot under us is not road, step sideways
+        -- until we find some and ease over to it instead of ploughing on.
+        local hit, surfaceNormal
+        if AutoDrive.HugRoad then
+            -- The lane sweep is ~26 raycasts, so run it a few times a second
+            -- and ease towards the answer rather than re-deciding every frame.
+            if tick() - AutoDrive.LaneAt > AutoDrive.LaneScanEvery then
+                AutoDrive.LaneAt = tick()
+                local target, _, width = findLane(model, pos, right,
+                    AutoDrive.LaneHalfWidth, AutoDrive.LaneMaxOffset)
+                if target then
+                    AutoDrive.LaneTarget = target
+                    AutoDrive.RoadWidth = width or 0
+                else
+                    AutoDrive.LaneTarget = 0
+                end
+            end
+            AutoDrive.Lateral = AutoDrive.Lateral
+                + (AutoDrive.LaneTarget - AutoDrive.Lateral) * AutoDrive.LaneEase
+            if math.abs(AutoDrive.Lateral) > 0.05 then
+                pos = pos + right * AutoDrive.Lateral
+            end
+        end
+        hit = raycastDown(pos, model, 40, 220)
+
+        -- Sit on the actual road surface where it has streamed in; fall back to
+        -- the interpolated node height where it has not. A big disagreement
+        -- means we hit an overpass deck or the ground under a bridge rather
+        -- than our own road, so the node height wins.
+        if hit and math.abs((hit.Position.Y + math.min(AutoDrive.Hover, AutoDrive.HoverMax)) - pos.Y) <= 25 then
+            local hover = math.clamp(AutoDrive.Hover, 0, AutoDrive.HoverMax)
+            local wantY = hit.Position.Y + hover
+            -- Ease onto the surface instead of snapping. Road seams, kerbs and
+            -- bridge joints are a stud or two apart and snapping to each one is
+            -- what made the car look like it was vibrating.
+            if not AutoDrive.SmoothY then
+                AutoDrive.SmoothY = wantY
+            else
+                AutoDrive.SmoothY = AutoDrive.SmoothY + (wantY - AutoDrive.SmoothY) * 0.25
+                if math.abs(wantY - AutoDrive.SmoothY) > 12 then AutoDrive.SmoothY = wantY end
+            end
+            pos = Vector3.new(pos.X, AutoDrive.SmoothY, pos.Z)
+            if hit.Normal and hit.Normal.Y > 0.5 then surfaceNormal = hit.Normal end
+        else
+            AutoDrive.SmoothY = pos.Y
+        end
+
+        -- Bank the car onto the road surface. Staying rigidly level on a slope
+        -- drives the suspension through the tarmac, which is half of why the
+        -- rims were shaking. Ease the normal too, or a kerb clipped by one ray
+        -- tips the whole car for a frame.
+        local rawUp = surfaceNormal or Vector3.new(0, 1, 0)
+        AutoDrive.Up = AutoDrive.Up and AutoDrive.Up:Lerp(rawUp, 0.15) or rawUp
+        if AutoDrive.Up.Magnitude < 1e-3 then AutoDrive.Up = Vector3.new(0, 1, 0) end
+        local up = AutoDrive.Up.Unit
+        local rx = AutoDrive.Dir:Cross(up)
+        local cf
+        if rx.Magnitude > 1e-3 then
+            rx = rx.Unit
+            cf = CFrame.fromMatrix(pos, rx, rx:Cross(AutoDrive.Dir).Unit)
+        else
+            cf = CFrame.lookAt(pos, pos + AutoDrive.Dir)
+        end
+
+        pcall(function() model:PivotTo(cf) end)
+        reportDrivingVelocity(model, AutoDrive.Dir, AutoDrive.Speed)
+        AutoDrive.Status = AutoDrive.Coasting and "waiting for map" or "driving"
+    end
+end)
+
+--=====================================================================
+--  Criminal / ATM farm
+--=====================================================================
+-- Last-resort seeds, only used before the road graph is ready. Everything the
+-- farms actually search is derived from the live map below.
+local HUNT_POSITIONS = {
+    Vector3.new(-2060, 15, 3415),
+    Vector3.new(-2846, 11, -1549),
+    Vector3.new(-1055, 12, 5048),
+    Vector3.new(-1893, 14, 2198),
+    Vector3.new(-300,  26, -654),
+}
+
+-- ATMs, crime scenes and the rest are streamed out until you are near them, so
+-- every farm has to go looking. Rather than a fixed list of coordinates that
+-- rots on the next map update, spread search points across the road network we
+-- already built: one per large grid cell, so they cover the whole map.
+local _huntCache, _huntCacheGen = nil, -1
+local function huntPositions()
+    if _huntCache and _huntCacheGen == RoadNav.Generation then return _huntCache end
+    if not RoadNav.Built or #RoadNav.Nodes < 50 then return HUNT_POSITIONS end
+
+    local CELL = 2500
+    local seen, out = {}, {}
+    for _, n in ipairs(RoadNav.Nodes) do
+        local key = math.floor(n.p.X / CELL) .. "," .. math.floor(n.p.Z / CELL)
+        if not seen[key] then
+            seen[key] = true
+            table.insert(out, n.p)
+        end
+    end
+    if #out < 4 then return HUNT_POSITIONS end
+
+    -- shuffle so two sessions do not sweep in the same order
+    for i = #out, 2, -1 do
+        local j = math.random(i)
+        out[i], out[j] = out[j], out[i]
+    end
+    _huntCache, _huntCacheGen = out, RoadNav.Generation
+    return out
+end
+
+local _huntIdx = 0
+local function nextHuntPosition()
+    local list = huntPositions()
+    _huntIdx = (_huntIdx % #list) + 1
+    return list[_huntIdx], #list
 end
 
 task.spawn(function()
@@ -383,7 +1731,7 @@ local function refreshHeistDataCache()
     if ok and cfg and cfg.HeistData then _heistDataCache = cfg.HeistData end
 end
 task.spawn(function()
-    while true do refreshHeistDataCache() task.wait(30) end
+    while alive() do refreshHeistDataCache() task.wait(30) end
 end)
 
 local HeistTiming = { LastStartedId = nil, LastStartedAt = 0 }
@@ -644,9 +1992,10 @@ local function tpHighAndWaitForStars(maxWait)
 end
 
 task.spawn(function()
-    while true do
+    while alive() do
         task.wait(0.2)
-        if AutoFarm.Enabled then
+        -- Do not fight AutoDrive for the seat.
+        if AutoFarm.Enabled and not AutoDrive.Enabled then
             local hum = getHumanoid()
             if hum and hum.SeatPart then
                 pcall(function() hum.Sit = false end)
@@ -665,7 +2014,7 @@ local function antiArrestPanic()
     local h = getHRP()
     if h then
         h.CFrame = h.CFrame + Vector3.new(0, STAR_EVADE_HEIGHT, 0)
-        notify("AntiArrest", "Yeeted — waiting for circle to clear", 2, "warning")
+        notify("AntiArrest", "Yeeted -- waiting for circle to clear", 2, "warning")
     end
     local stop = tick() + 30
     while tick() < stop do
@@ -677,7 +2026,7 @@ local function antiArrestPanic()
 end
 
 task.spawn(function()
-    while true do
+    while alive() do
         task.wait(0.2)
         if AntiArrest.Enabled and not inHeistNow() then
             local c = LocalPlayer.Character
@@ -730,23 +2079,20 @@ local function runHeistOnce()
         end
         task.wait(0.2)
     end
-    depositAndEvade("Heist bag full — depositing")
+    depositAndEvade("Heist bag full -- depositing")
     AutoFarm.Stats.Heists = AutoFarm.Stats.Heists + 1
 end
 
 task.spawn(function()
-
-    while true do
+    while alive() do
         task.wait(0.4)
         if not AutoFarm.Enabled then AutoFarm.Phase = "idle" continue end
         if isInSeat() then
-            if AutoFarm.Phase ~= "inSeat" then  end
             AutoFarm.Phase = "inSeat"
             continue
         end
 
         if (LocalPlayer:GetAttribute("JobId") or "") ~= "Criminal" then
-
             joinCriminalJob()
             task.wait(0.5)
             continue
@@ -769,14 +2115,14 @@ task.spawn(function()
             if AutoFarm.DepositThreshold > 0
                and getCurrentBagValue() >= AutoFarm.DepositThreshold
                and checkDropoffRequirements() then
-                depositAndEvade(("Hit threshold $%d — depositing"):format(getCurrentBagValue()))
+                depositAndEvade(("Hit threshold $%d -- depositing"):format(getCurrentBagValue()))
             end
             continue
         end
 
-        local meets, _ = checkDropoffRequirements()
+        local meets = checkDropoffRequirements()
         if meets then
-            depositAndEvade("All ATMs busted — depositing")
+            depositAndEvade("All ATMs busted -- depositing")
             continue
         end
 
@@ -787,8 +2133,7 @@ task.spawn(function()
         end
 
         AutoFarm.Phase = "huntingATMs"
-        local hp = HUNT_POSITIONS[((AutoFarm._huntIdx or 0) % #HUNT_POSITIONS) + 1]
-        AutoFarm._huntIdx = (AutoFarm._huntIdx or 0) + 1
+        local hp = nextHuntPosition()
 
         requestStreamAround(hp)
         local hh = getHRP()
@@ -803,328 +2148,11 @@ task.spawn(function()
     end
 end)
 
-local CAR_START_CFRAME = nil
-
-local BASIC_START_CF = CFrame.new(
-    1289.8360595703125, 11.043543815612793, 738.3447265625,
-    0.40989866852760315, 0.0007030181004665792, -0.9121307730674744,
-    -0.00042778803617693484, 0.9999997615814209, 0.0005785005632787943,
-    0.9121309518814087, 0.000153072047396563, 0.40989887714385986
-)
-
-local BASIC_CAR_SPAWN_PLAYER_CF = CFrame.new(1289.8360595703125, 11.043543815612793, 738.3447265625)
-
-local SPAWN_DIRECTION = Vector3.new(0.8895771503448486, 0, -0.4567849934101105)
-
-local VEHICLE_REMOTE_PATH = game:GetService("ReplicatedStorage"):WaitForChild("Remotes"):WaitForChild("VehicleEvent")
-
-local CAR_SPAWN_WAIT = 3.2
-
-local MANUAL_BEST_CAR = "Nissan-GTR2017"
-
-local GOOD_CARS_PRIORITY = {
-    "Bugatti La Voiture Noire",
-    "Koenigsegg Jesko",
-    "Bugatti Chiron",
-    "Rimac Nevera",
-    "Pininfarina Battista",
-    "Nissan-GTR2017",
-}
-
-local CarFarm = {
-    Enabled        = false,
-    Speed          = 6,
-    SnapToRoad     = true,
-    GroundOffset   = 0,
-    LookAhead      = 50,
-    SmoothFactor   = 0.20,
-    ExploreChance  = 0.10,
-    CurFwd         = Vector3.new(0, 0, -1),
-    CurUp          = Vector3.new(0, 1, 0),
-    Stuck          = 0,
-    DeadEndStreak  = 0,
-    ExploreCooldown = 0,
-    FrameCount     = 0,
-    LastTurnFrame  = 0,
-    TurnGrace      = 30,
-    StuckHistory   = {},
-    StuckLastSample = 0,
-    StuckRecoveryUntil = 0,
-    CurrentLane    = nil,
-    LastGoodDottedTarget = nil,
-
-    Mode = "FullAI",
-    BasicDistance = 15000,
-
-    UseAdvancedLanePlanning = true,
-    ArrowLookAhead          = 85,
-    LastArrowScan           = 0,
-    ArrowHints              = {},
-    UseArrowBias            = false,
-    CorridorDebug           = false,
-}
-
-local function getDrivenVehicleModel()
-    local hum = getHumanoid()
-    local seat = hum and hum.SeatPart
-    if not seat or not seat:IsA("VehicleSeat") then return nil, nil end
-
-    local current = seat
-    while current do
-        if current:IsA("Model") and current:FindFirstChild("Core") then
-            return current, seat
-        end
-        current = current.Parent
-    end
-
-    local model = seat:FindFirstAncestorOfClass("Model")
-    return model, seat
-end
-
-local function raycastDown(pos, model, upOffset, dist)
-    local rp = RaycastParams.new()
-    rp.FilterType = Enum.RaycastFilterType.Exclude
-    local filter = { model }
-    if LocalPlayer.Character then table.insert(filter, LocalPlayer.Character) end
-    rp.FilterDescendantsInstances = filter
-    rp.IgnoreWater = true
-    local from = pos + Vector3.new(0, upOffset or 5, 0)
-    return Workspace:Raycast(from, Vector3.new(0, -(dist or 500), 0), rp)
-end
-
-local function getPlateCenter(model)
-    return model and model:FindFirstChild("PlateCenter")
-end
-
-local WHEEL_NAMES = { "FR", "FL", "RL", "RR" }
-
-local _markerCache = nil
-local _markerCacheT = 0
-
-local function getWeightPart(model)
-    if not model then return nil end
-    return model:FindFirstChild("Weight")
-        or model:FindFirstChild("WeightPart")
-        or model.PrimaryPart
-end
-
-local function getVehicleId(model)
-    if not model then return nil end
-    local fromAttr = model:GetAttribute("VehicleId")
-    if fromAttr then return fromAttr end
-    local vo = model:FindFirstChild("VehicleObject")
-    if vo and vo:IsA("ObjectValue") and vo.Value then
-        return vo.Value.Name
-    end
-    return nil
-end
-
-local function fireVehicleSimulation(model)
-    local vid = getVehicleId(model)
-    if not vid or not Remotes then return end
-    pcall(function() Remotes.fireServer("RequestVehicleSimulation", { vid }) end)
-end
-
-local function GetBestOwnedCar()
-    if MANUAL_BEST_CAR and MANUAL_BEST_CAR ~= "" then
-
-        return MANUAL_BEST_CAR
-    end
-
-    local player = LocalPlayer
-    local ownedCars = {}
-
-    local candidates = {
-        player:FindFirstChild("Vehicles"),
-        player:FindFirstChild("OwnedVehicles"),
-        player:FindFirstChild("Cars"),
-        player:FindFirstChild("Garage"),
-    }
-
-    for _, folder in ipairs(candidates) do
-        if folder then
-            for _, child in ipairs(folder:GetChildren()) do
-                local name = child.Value or child.Name
-                if type(name) == "string" and name ~= "" then
-                    ownedCars[name] = true
-                end
-            end
-        end
-    end
-
-    local rs = game:GetService("ReplicatedStorage")
-    local dataRoot = rs:FindFirstChild("Data") or rs:FindFirstChild("PlayerData")
-    if dataRoot then
-        local myData = dataRoot:FindFirstChild(tostring(player.UserId)) or dataRoot:FindFirstChild(player.Name)
-        if myData then
-            local vehFolder = myData:FindFirstChild("Vehicles") or myData:FindFirstChild("Cars") or myData:FindFirstChild("OwnedVehicles")
-            if vehFolder then
-                for _, child in ipairs(vehFolder:GetChildren()) do
-                    local name = child.Value or child.Name
-                    if type(name) == "string" and name ~= "" then
-                        ownedCars[name] = true
-                    end
-                end
-            end
-        end
-    end
-
-    local foundList = {}
-    for k in pairs(ownedCars) do table.insert(foundList, k) end
-
-    for _, carName in ipairs(GOOD_CARS_PRIORITY) do
-        if ownedCars[carName] then
-            return carName
-        end
-    end
-
-    for carName in pairs(ownedCars) do
-        return carName
-    end
-
-    return nil
-end
-
-local function ensureBestCarSpawnedAndEntered()
-
-    local hrp = getHRP()
-    if not hrp then
-        warn("[DE][BASIC] No HRP found")
-        return false
-    end
-
-    hrp.CFrame = BASIC_CAR_SPAWN_PLAYER_CF
-    task.wait(0.4)
-
-    local bestCarToSpawn = GetBestOwnedCar() or "Unknown"
-
-    if not bestCarToSpawn or bestCarToSpawn == "Unknown" then
-        warn("[DE][BASIC] Could not detect any cars you own.")
-        warn("[DE][BASIC] Check the line above that says 'Cars detected as owned:' — it should list your vehicles.")
-        return false
-    end
-
-    pcall(function()
-        local args = {
-            "Spawn",
-            bestCarToSpawn,
-            [5] = SPAWN_DIRECTION
-        }
-        VEHICLE_REMOTE_PATH:FireServer(unpack(args))
-    end)
-
-    task.wait(CAR_SPAWN_WAIT)
-
-    local function findNearbyVehicle(maxDist, targetCarName)
-        local playerPos = hrp.Position
-        local candidates = {}
-
-        local searchRoots = {
-            Workspace,
-            Workspace:FindFirstChild("Cars"),
-            Workspace:FindFirstChild("Vehicles"),
-            Workspace:FindFirstChild("SpawnedCars"),
-            Workspace:FindFirstChild("Map"),
-        }
-
-        for _, root in ipairs(searchRoots) do
-            if root then
-                for _, obj in ipairs(root:GetDescendants()) do
-                    if obj:IsA("Model") and obj ~= LocalPlayer.Character then
-                        local seat = obj:FindFirstChildOfClass("VehicleSeat") or obj:FindFirstChildOfClass("Seat")
-                        if seat then
-                            if obj:FindFirstChild("Core") then
-                                local dist = (obj:GetPivot().Position - playerPos).Magnitude
-                                if dist < maxDist then
-                                    table.insert(candidates, {model = obj, seat = seat, dist = dist})
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-        end
-
-        local function nameMatchScore(name)
-            if targetCarName and string.lower(name):find(string.lower(targetCarName)) then
-                return 1000
-            end
-            return 0
-        end
-
-        table.sort(candidates, function(a, b)
-            local scoreA = nameMatchScore(a.model.Name) + (a.seat.Occupant and 0 or 100)
-            local scoreB = nameMatchScore(b.model.Name) + (b.seat.Occupant and 0 or 100)
-
-            if scoreA ~= scoreB then
-                return scoreA > scoreB
-            end
-            return a.dist < b.dist
-        end)
-
-        if #candidates > 0 then
-            return candidates[1].model
-        end
-
-        return nil
-    end
-
-    local bestCar = nil
-    local maxSearchTime = 10
-    local startTime = tick()
-
-    while tick() - startTime < maxSearchTime and not bestCar do
-        bestCar = findNearbyVehicle(220, bestCarToSpawn)
-        if not bestCar then
-            task.wait(0.5)
-        end
-    end
-
-    if not bestCar then
-        warn("[DE][BASIC] Could not find a spawned car nearby after waiting. Try increasing CAR_SPAWN_WAIT or check if the car name is correct.")
-        return false
-    end
-
-    local foundName = bestCar.Name
-    local requestedName = bestCarToSpawn or "Unknown"
-
-    if not string.lower(foundName):find(string.lower(requestedName)) then
-        warn("══════════════════════════════════════════════════════════════")
-        warn("[DE][BASIC] WARNING: We tried to spawn '" .. requestedName .. "' but found '" .. foundName .. "' instead.")
-        warn("[DE][BASIC] This usually means the spawn failed or the car is not yours.")
-        warn("══════════════════════════════════════════════════════════════")
-    end
-
-    local seat = bestCar:FindFirstChildOfClass("VehicleSeat") or bestCar:FindFirstChildOfClass("Seat")
-    local hum = getHumanoid()
-    if seat and hum then
-        hum.Sit = true
-        pcall(function() seat:Sit(hum) end)
-        task.wait(0.8)
-    else
-        warn("[DE][BASIC] Found car but no usable seat inside it.")
-    end
-
-    local cam = Workspace.CurrentCamera
-    local oldType = cam.CameraType
-    pcall(function()
-        cam.CameraType = Enum.CameraType.Scriptable
-    end)
-    task.wait(0.2)
-
-    local carPos = bestCar:GetPivot().Position
-    cam.CFrame = CFrame.new(carPos + Vector3.new(15, 8, 15), carPos)
-
-    task.wait(1.2)
-
-    cam.CameraType = oldType or Enum.CameraType.Custom
-
-    task.wait(0.3)
-
-    return true
-end
-
-local Police = { CrimeScene = false, Arrest = false, CSStats = 0, ArrStats = 0, Running = false, ArrRunning = false }
+--=====================================================================
+--  Police
+--=====================================================================
+local Police = { CrimeScene = false, Arrest = false, CSStats = 0, ArrStats = 0,
+                 ArrStatus = "idle", ArrestTeleport = true, CSStatus = "idle" }
 
 local function joinSecurityJob() startJobSession("Security") end
 
@@ -1194,7 +2222,7 @@ local function useCrimeSceneOnce(cs, pos)
 end
 
 task.spawn(function()
-    while true do
+    while alive() do
         task.wait(0.3)
         if not Police.CrimeScene then continue end
         if isInSeat() then continue end
@@ -1202,7 +2230,23 @@ task.spawn(function()
             joinSecurityJob(); task.wait(0.6); continue
         end
         local scenes = getSortedCrimeScenes()
-        if #scenes == 0 then task.wait(1); continue end
+        if #scenes == 0 then
+            -- Crime scenes are streamed out until you are near them, so the old
+            -- behaviour of waiting in place found nothing forever. Sweep the map
+            -- the same way the ATM farm does.
+            local hp, total = nextHuntPosition()
+            Police.CSStatus = ("searching (%d spots)"):format(total)
+            requestStreamAround(hp)
+            local h = getHRP()
+            if h then h.CFrame = CFrame.new(hp + Vector3.new(0, 5, 0)) end
+            for _ = 1, 12 do
+                if not Police.CrimeScene then break end
+                task.wait(0.5)
+                if #getCrimeSceneParts() > 0 then break end
+            end
+            continue
+        end
+        Police.CSStatus = ("%d scene(s)"):format(#scenes)
 
         for _, e in ipairs(scenes) do
             if not Police.CrimeScene then break end
@@ -1214,55 +2258,161 @@ task.spawn(function()
     end
 end)
 
+-- A criminal is only wanted if their character exists and carries the
+-- CriminalExpireEpoch attribute, which replicates to everyone.
+local function isWantedPlayer(plr)
+    if plr == LocalPlayer then return false end
+    local char = plr.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return false end
+    if CriminalUtil and CriminalUtil.IsPlayerWanted then
+        local ok, wanted = pcall(CriminalUtil.IsPlayerWanted, plr)
+        if ok then return wanted == true end
+    end
+    local exp = char:GetAttribute("CriminalExpireEpoch") or 0
+    return exp ~= 0 and os.time() < exp
+end
+
 local function getWantedCriminals()
     local out = {}
     for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LocalPlayer then
-            local ok, wanted = pcall(function()
-                return CriminalUtil and CriminalUtil.IsPlayerWanted(plr)
-            end)
-            if ok and wanted then table.insert(out, plr) end
-        end
+        if isWantedPlayer(plr) then table.insert(out, plr) end
+    end
+    local myHRP = getHRP()
+    if myHRP then
+        table.sort(out, function(a, b)
+            local ah = a.Character and a.Character:FindFirstChild("HumanoidRootPart")
+            local bh = b.Character and b.Character:FindFirstChild("HumanoidRootPart")
+            if not ah or not bh then return false end
+            return (ah.Position - myHRP.Position).Magnitude < (bh.Position - myHRP.Position).Magnitude
+        end)
     end
     return out
 end
+
+-- Move to a spot, taking the car with us if we are sitting in one. Setting
+-- HumanoidRootPart.CFrame while seated fights the seat weld and leaves the
+-- car behind, which is why arresting from a vehicle never worked.
+local function moveSelfTo(cf)
+    local model = getDrivenVehicleModel()
+    if model then
+        local ok = pcall(function() model:PivotTo(cf) end)
+        if ok then
+            killMomentum(model)
+            return true
+        end
+    end
+    local hrp = getHRP()
+    if hrp then
+        hrp.CFrame = cf
+        return true
+    end
+    return false
+end
+
+-- How close the server wants us. On foot this is 15 studs; in a car it scales
+-- with the criminal's top speed, so sit well inside whatever it returns --
+-- but never so close that a car body lands on top of them.
+local function arrestStandoff(crim)
+    local radius = 15
+    if SecurityUtil and SecurityUtil.GetArrestRadius then
+        local ok, r = pcall(SecurityUtil.GetArrestRadius, LocalPlayer, crim)
+        if ok and type(r) == "number" and r > 0 then radius = r end
+    elseif SecurityConstants and SecurityConstants.NotDrivingArrestRadius then
+        radius = SecurityConstants.NotDrivingArrestRadius
+    end
+    local minGap = getDrivenVehicleModel() and 14 or 3
+    return math.clamp(radius * 0.35, minGap, math.max(minGap, radius - 2))
+end
+
+local function arrestHoldSeconds()
+    local t = (SecurityConstants and SecurityConstants.ArrestTimeSeconds) or 4
+    return t + 1.5    -- margin for latency
+end
+
+-- One arrest attempt: announce, hold station for the full arrest timer, then
+-- make a single request. The old version fired RequestArrestCriminal every
+-- 0.4s, which the server has no reason to honour and which is exactly the
+-- pattern their ArrestAbuse detection looks for.
+local function tryArrest(crim)
+    local myHRP = getHRP()
+    local cHRP = crim.Character and crim.Character:FindFirstChild("HumanoidRootPart")
+    if not myHRP or not cHRP then return false, "gone" end
+
+    local standoff = arrestStandoff(crim)
+    local function station()
+        local ch = crim.Character and crim.Character:FindFirstChild("HumanoidRootPart")
+        if not ch then return false end
+        if not Police.ArrestTeleport then
+            return getHRP() ~= nil    -- you are driving there yourself
+        end
+        return moveSelfTo(ch.CFrame * CFrame.new(0, 0, standoff))
+    end
+
+    if not station() then return false, "gone" end
+    pcall(function() fireRemoteEvent("NotifyStartArresting", crim, 0) end)
+
+    local deadline = tick() + arrestHoldSeconds()
+    while tick() < deadline do
+        if not Police.Arrest then
+            pcall(function() fireRemoteEvent("NotifyStopArresting", crim) end)
+            return false, "cancelled"
+        end
+        if not station() then
+            pcall(function() fireRemoteEvent("NotifyStopArresting", crim) end)
+            return false, "target left"
+        end
+        if not isWantedPlayer(crim) then
+            -- Someone else got them, or the wanted timer ran out.
+            pcall(function() fireRemoteEvent("NotifyStopArresting", crim) end)
+            return false, "no longer wanted"
+        end
+        task.wait(0.1)
+    end
+
+    pcall(function() fireRemoteEvent("RequestArrestCriminal", crim) end)
+
+    local check = tick() + 2.5
+    local ok = false
+    while tick() < check do
+        if not isWantedPlayer(crim) then ok = true break end
+        station()
+        task.wait(0.15)
+    end
+
+    pcall(function() fireRemoteEvent("NotifyStopArresting", crim) end)
+    return ok, ok and "arrested" or "rejected"
+end
+
 task.spawn(function()
-    while true do
+    while alive() do
         task.wait(0.5)
         if not Police.Arrest then continue end
         if (LocalPlayer:GetAttribute("JobId") or "") ~= "Security" then
-            joinSecurityJob(); task.wait(0.6); continue
+            joinSecurityJob(); task.wait(1.5); continue
         end
         local targets = getWantedCriminals()
+        if #targets == 0 then
+            Police.ArrStatus = "no wanted criminals in server"
+            continue
+        end
         for _, crim in ipairs(targets) do
             if not Police.Arrest then break end
-            local cChar = crim.Character
-            local cHRP = cChar and cChar:FindFirstChild("HumanoidRootPart")
-            local myHRP = getHRP()
-            if cHRP and myHRP then
-                myHRP.CFrame = cHRP.CFrame * CFrame.new(0, 0, 4)
-                pcall(function() fireRemoteEvent("NotifyStartArresting", crim, 0) end)
-                local stop = tick() + 6
-                local done = false
-                while tick() < stop and Police.Arrest do
-                    local cc = crim.Character
-                    local ch = cc and cc:FindFirstChild("HumanoidRootPart")
-                    local mh = getHRP()
-                    if not ch or not mh then break end
-                    mh.CFrame = ch.CFrame * CFrame.new(0, 0, 4)
-                    pcall(function() fireRemoteEvent("RequestArrestCriminal", crim) end)
-                    if not (CriminalUtil and CriminalUtil.IsPlayerWanted(crim)) then
-                        done = true; break
-                    end
-                    task.wait(0.4)
-                end
-                pcall(function() fireRemoteEvent("NotifyStopArresting", crim) end)
-                if done then Police.ArrStats = Police.ArrStats + 1 end
+            Police.ArrStatus = "arresting " .. crim.Name
+            local ok, why = tryArrest(crim)
+            if ok then
+                Police.ArrStats = Police.ArrStats + 1
+                Police.ArrStatus = "arrested " .. crim.Name
+            else
+                Police.ArrStatus = crim.Name .. ": " .. tostring(why)
             end
+            task.wait(1)   -- let the server settle before the next one
         end
     end
 end)
 
+--=====================================================================
+--  Delivery
+--=====================================================================
 local AutoDelivery = { Enabled = false, Delay = 0.45 }
 local function getDeliveryState()
     if not DeliveryJobTask or not DeliveryJobTask.GetCurrentDeliveryState then return nil end
@@ -1288,28 +2438,7 @@ local function nearestDeliveryLocationTo(pos)
     return best
 end
 
-local function teleportEntity(pos, yOff)
-    yOff = yOff or 5
-    local model = getDrivenVehicleModel and getDrivenVehicleModel()
-    if model then
-        local ok, pivot = pcall(function() return model:GetPivot() end)
-        local rot = ok and pivot and (pivot - pivot.Position) or CFrame.identity
-        pcall(function()
-            model:PivotTo(rot + (pos + Vector3.new(0, yOff, 0)))
-            local wp = getWeightPart and getWeightPart(model)
-            if wp then
-                wp.AssemblyLinearVelocity = Vector3.zero
-                wp.AssemblyAngularVelocity = Vector3.zero
-            end
-        end)
-        return true
-    end
-    local hrp = getHRP()
-    if hrp then hrp.CFrame = CFrame.new(pos + Vector3.new(0, yOff, 0)) end
-    return false
-end
-
-local function deliveryGoInteract(targetPos, label)
+local function deliveryGoInteract(targetPos)
     local loc = nearestDeliveryLocationTo(targetPos)
     if not loc then return false end
     local d = math.max(0.1, AutoDelivery.Delay or 0.45)
@@ -1324,7 +2453,7 @@ local function deliveryGoInteract(targetPos, label)
 end
 
 task.spawn(function()
-    while true do
+    while alive() do
         task.wait(0.6)
         if not AutoDelivery.Enabled then continue end
         if (LocalPlayer:GetAttribute("JobId") or "") ~= "Delivery" then
@@ -1337,9 +2466,8 @@ task.spawn(function()
         local cap = st.MaxCapacity or 4
 
         if st.PickupPosition and carried < cap then
-            local ok, loc = deliveryGoInteract(st.PickupPosition, "pickup")
+            local ok, loc = deliveryGoInteract(st.PickupPosition)
             if ok and loc then
-
                 local before = carried
                 local stop = tick() + 2
                 while tick() < stop and AutoDelivery.Enabled do
@@ -1354,12 +2482,11 @@ task.spawn(function()
         end
 
         if st.DestinationPosition then
-            local ok, loc = deliveryGoInteract(st.DestinationPosition, "dropoff")
+            local ok, loc = deliveryGoInteract(st.DestinationPosition)
             if ok and loc then
                 local stop = tick() + 2.5
                 while tick() < stop and AutoDelivery.Enabled do
                     local s2 = getDeliveryState()
-
                     if not s2 or (s2.ItemsCarried or 0) == 0 then break end
                     task.wait(0.2)
                 end
@@ -1372,6 +2499,9 @@ task.spawn(function()
     end
 end)
 
+--=====================================================================
+--  Misc farms and vehicle tweaks
+--=====================================================================
 local PlaytimeRewards = { Enabled = false }
 local function claimAllPlaytime()
     for i = 1, 12 do
@@ -1382,7 +2512,7 @@ local function claimAllPlaytime()
     pcall(function() Remotes.fireServer("RaceLeaderboardClaimRewards") end)
 end
 task.spawn(function()
-    while true do
+    while alive() do
         if PlaytimeRewards.Enabled then claimAllPlaytime() end
         task.wait(15)
     end
@@ -1393,10 +2523,10 @@ local function applyPaint(section, vehicleId, col)
     return invokeRemoteFunction("CustomizationPurchase", "Paint", section, vehicleId, { Color = col })
 end
 task.spawn(function()
-    while true do
+    while alive() do
         local iv = math.max(0.2, Rainbow.Interval or 0.4)
         if not Rainbow.Enabled then task.wait(0.3); continue end
-        local model = getDrivenVehicleModel and getDrivenVehicleModel()
+        local model = getDrivenVehicleModel()
         local vid = model and getVehicleId(model)
         if not vid then task.wait(0.3); continue end
         local hue = (tick() * Rainbow.Speed) % 1
@@ -1410,12 +2540,12 @@ end)
 
 local VehFly = { Enabled = false, Speed = 80 }
 task.spawn(function()
-    while true do
+    while alive() do
         RunService.Heartbeat:Wait()
         if not VehFly.Enabled then continue end
-        local model = getDrivenVehicleModel and getDrivenVehicleModel()
+        local model = getDrivenVehicleModel()
         if not model then continue end
-        local wp = getWeightPart and getWeightPart(model)
+        local wp = getWeightPart(model)
         if not wp then continue end
         local cam = Workspace.CurrentCamera
         local dir = Vector3.zero
@@ -1435,35 +2565,29 @@ end)
 
 local AntiFlip = { Enabled = false }
 task.spawn(function()
-    while true do
+    while alive() do
         task.wait(0.2)
         if not AntiFlip.Enabled then continue end
-        local model = getDrivenVehicleModel and getDrivenVehicleModel()
+        if AutoDrive.Enabled then continue end
+        local model = getDrivenVehicleModel()
         if not model then continue end
         local ok, pivot = pcall(function() return model:GetPivot() end)
         if not ok or not pivot then continue end
         if pivot.UpVector.Y < 0.4 then
-
             local fwd = pivot.LookVector
             local flatFwd = Vector3.new(fwd.X, 0, fwd.Z)
             if flatFwd.Magnitude < 0.01 then flatFwd = Vector3.new(0, 0, -1) end
             flatFwd = flatFwd.Unit
             local upright = CFrame.lookAt(pivot.Position + Vector3.new(0, 3, 0), pivot.Position + Vector3.new(0, 3, 0) + flatFwd)
-            pcall(function()
-                model:PivotTo(upright)
-                local wp = getWeightPart and getWeightPart(model)
-                if wp then
-                    wp.AssemblyLinearVelocity = Vector3.zero
-                    wp.AssemblyAngularVelocity = Vector3.zero
-                end
-            end)
+            pcall(function() model:PivotTo(upright) end)
+            killMomentum(model)
         end
     end
 end)
 
 local PlayerMods = { WalkEnabled = false, WalkSpeed = 32 }
 task.spawn(function()
-    while true do
+    while alive() do
         task.wait(0.3)
         if not PlayerMods.WalkEnabled then continue end
         local hum = getHumanoid()
@@ -1473,7 +2597,7 @@ end)
 
 local CashCollect = { Enabled = false }
 task.spawn(function()
-    while true do
+    while alive() do
         task.wait(0.5)
         if not CashCollect.Enabled then continue end
         local hrp = getHRP()
@@ -1540,7 +2664,7 @@ local STOCK_MULTS = { SpeedMult=1, AccelMult=1, BrakeMult=1, GripMult=1, TurnMul
 
 local _modsDirty = false
 task.spawn(function()
-    while true do
+    while alive() do
         RunService.Heartbeat:Wait()
         if not VehicleController then continue end
         local ok, ctrl = pcall(VehicleController.getActiveChassisController)
@@ -1575,10 +2699,10 @@ task.spawn(function()
             pcall(function()
                 local braking = (ctrl.BrakeInput and ctrl.BrakeInput > 0.5) or ctrl.Handbrake
                 if braking then
-                    local wp = getWeightPart and getWeightPart(ctrl.VehicleModel)
+                    local wp = getWeightPart(ctrl.VehicleModel)
                     if not wp then
-                        local m = getDrivenVehicleModel and getDrivenVehicleModel()
-                        wp = m and getWeightPart and getWeightPart(m)
+                        local m = getDrivenVehicleModel()
+                        wp = m and getWeightPart(m)
                     end
                     if wp then
                         local v = wp.AssemblyLinearVelocity
@@ -1591,6 +2715,9 @@ task.spawn(function()
     end
 end)
 
+--=====================================================================
+--  ESP
+--=====================================================================
 local ESP = {
     Enabled = false, Box = true, Name = true, Distance = true,
     Tracer = false, HealthBar = true, TeamCheck = false,
@@ -1634,9 +2761,9 @@ local function removeESP(plr)
     end
 end
 
-Players.PlayerRemoving:Connect(removeESP)
+track(Players.PlayerRemoving:Connect(removeESP))
 
-RunService.RenderStepped:Connect(function()
+track(RunService.RenderStepped:Connect(function()
     if not ESP.Enabled then
         for _, o in pairs(espObjects) do hideESP(o) end
         return
@@ -1703,8 +2830,11 @@ RunService.RenderStepped:Connect(function()
             o.hp.Visible = true
         elseif o.hp then o.hp.Visible = false; o.hpbg.Visible = false end
     end
-end)
+end))
 
+--=====================================================================
+--  GUI
+--=====================================================================
 local window
 do
     local ok, w = pcall(function()
@@ -1755,7 +2885,7 @@ GuiLibrary:CreateInput(tabCrim, "Auto-deposit at $ (e.g. 100k, 1M)", function(te
         notify("Threshold", ("Auto-deposit at $%s"):format(tostring(math.floor(v))), 2, "success")
     else
         AutoFarm.DepositThreshold = 0
-        if text and text ~= "" then notify("Threshold", "Invalid — disabled", 3, "warning") end
+        if text and text ~= "" then notify("Threshold", "Invalid -- disabled", 3, "warning") end
     end
 end)
 GuiLibrary:CreateSlider(tabCrim, "ATM hold grace (s)", 0, 1.5, 0.4, function(v) AutoFarm.HoldGrace = v end)
@@ -1765,7 +2895,7 @@ GuiLibrary:CreateButton(tabCrim, "Deposit Now", function()
         if not ok then notify("Deposit", "Cannot: " .. reason, 4, "error") return end
         local dok, derr = tryDepositAtDropoff()
         if dok then
-            notify("Deposit", "Success — escaping stars", 2, "success")
+            notify("Deposit", "Success -- escaping stars", 2, "success")
             tpHighAndWaitForStars(90)
         else
             notify("Deposit", "Failed: " .. tostring(derr), 4, "error")
@@ -1775,950 +2905,73 @@ end)
 
 GuiLibrary:CreateSection(tabCrim, "Status")
 local lblCrim1 = GuiLibrary:CreateLabel(tabCrim, "Idle")
-local lblCrim2 = GuiLibrary:CreateLabel(tabCrim, "—")
+local lblCrim2 = GuiLibrary:CreateLabel(tabCrim, "-")
 
-local RecordedPath = nil
-
-local _HARDCODED_PATH_DATA = {
-{1499.2756,11.1319,635.1451,0.4651,-0.0232,-0.8850,-0.0059,0.9996,-0.0293,0.8853,0.0189,0.4647},
-{1511.1119,11.4943,630.6146,0.5151,-0.0205,-0.8569,-0.0005,0.9997,-0.0242,0.8571,0.0129,0.5149},
-{1525.0062,12.0597,622.2750,0.5151,-0.0239,-0.8568,-0.0003,0.9996,-0.0280,0.8571,0.0147,0.5149},
-{1538.9116,12.6258,613.9312,0.5151,-0.0260,-0.8568,-0.0002,0.9995,-0.0305,0.8572,0.0159,0.5148},
-{1553.8685,13.2350,604.9605,0.5151,-0.0274,-0.8567,-0.0001,0.9995,-0.0321,0.8572,0.0166,0.5148},
-{1567.7667,13.8010,596.6193,0.5151,-0.0283,-0.8567,-0.0001,0.9995,-0.0331,0.8572,0.0171,0.5148},
-{1581.6615,14.3668,588.2826,0.5151,-0.0289,-0.8567,-0.0001,0.9994,-0.0337,0.8572,0.0174,0.5148},
-{1596.6207,14.9758,579.3026,0.5151,-0.0293,-0.8567,-0.0000,0.9994,-0.0342,0.8572,0.0176,0.5148},
-{1610.5133,15.5421,570.9655,0.5151,-0.0295,-0.8566,-0.0000,0.9994,-0.0344,0.8572,0.0178,0.5148},
-{1624.4012,16.1075,562.6251,0.5151,-0.0296,-0.8566,-0.0000,0.9994,-0.0346,0.8572,0.0178,0.5148},
-{1639.3519,16.7164,553.6542,0.5151,-0.0297,-0.8566,-0.0000,0.9994,-0.0347,0.8572,0.0179,0.5147},
-{1654.3041,17.3253,544.6805,0.5151,-0.0298,-0.8566,-0.0000,0.9994,-0.0348,0.8572,0.0179,0.5147},
-{1667.1361,17.8482,536.9793,0.5151,-0.0298,-0.8566,-0.0000,0.9994,-0.0348,0.8572,0.0179,0.5147},
-{1681.0243,18.4140,528.6389,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0348,0.8572,0.0180,0.5147},
-{1694.9163,18.9799,520.2964,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1707.7507,19.5026,512.5869,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1720.5735,20.0251,504.8825,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1735.5280,20.6341,495.9016,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1750.4775,21.2431,486.9221,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1764.3649,21.8089,478.5804,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1778.2528,22.3747,470.2384,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1791.0846,22.8974,462.5295,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1802.8469,23.3766,455.4631,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1815.6790,23.8993,447.7544,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1827.4468,24.3787,440.6833,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1840.2776,24.9014,432.9737,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1854.1681,25.4673,424.6274,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1866.9996,25.9901,416.9183,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1879.8270,26.5127,409.2126,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1893.7211,27.0785,400.8668,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1905.4862,27.5579,393.7976,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1918.3137,28.0805,386.0915,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1931.1462,28.6033,378.3830,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1943.9777,29.1260,370.6743,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1961.0380,29.8210,360.4227,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1975.9698,30.4294,351.4496,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1987.7319,30.9086,344.3844,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{1999.4988,31.3877,337.3164,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{2011.2611,31.8668,330.2511,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{2023.0254,32.3463,323.1862,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{2035.8590,32.8690,315.4795,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{2048.6907,33.3917,307.7712,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{2060.4575,33.8711,300.7004,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{2073.2881,34.3938,292.9902,0.5151,-0.0299,-0.8566,-0.0000,0.9994,-0.0349,0.8572,0.0180,0.5147},
-{2085.0552,34.8570,285.9189,0.5151,-0.0284,-0.8567,-0.0000,0.9995,-0.0332,0.8572,0.0171,0.5148},
-{2097.8916,35.1996,278.2032,0.5150,-0.0248,-0.8568,0.0000,0.9996,-0.0289,0.8572,0.0149,0.5148},
-{2110.7178,35.4614,270.4918,0.5150,-0.0213,-0.8569,0.0000,0.9997,-0.0248,0.8572,0.0128,0.5149},
-{2122.4846,35.7014,263.4207,0.5150,-0.0190,-0.8570,0.0000,0.9998,-0.0222,0.8572,0.0114,0.5149},
-{2136.3726,35.9846,255.0782,0.5150,-0.0176,-0.8570,0.0000,0.9998,-0.0205,0.8572,0.0105,0.5149},
-{2150.2654,36.2678,246.7360,0.5150,-0.0166,-0.8570,0.0000,0.9998,-0.0194,0.8572,0.0100,0.5149},
-{2164.1628,36.5510,238.3904,0.5150,-0.0160,-0.8570,0.0000,0.9998,-0.0187,0.8572,0.0096,0.5149},
-{2175.9368,36.7557,231.3179,0.5150,-0.0142,-0.8571,0.0000,0.9999,-0.0165,0.8572,0.0085,0.5149},
-{2189.8303,36.8176,222.9709,0.5150,-0.0091,-0.8571,0.0000,0.9999,-0.0106,0.8572,0.0054,0.5150},
-{2202.6628,36.8176,215.2610,0.5150,-0.0058,-0.8572,0.0000,1.0000,-0.0068,0.8572,0.0035,0.5150},
-{2215.4971,36.8176,207.5534,0.5150,-0.0037,-0.8572,0.0000,1.0000,-0.0043,0.8572,0.0022,0.5150},
-{2228.3303,36.8176,199.8467,0.5150,-0.0024,-0.8572,0.0000,1.0000,-0.0028,0.8572,0.0014,0.5150},
-{2240.1003,36.8176,192.7759,0.5150,-0.0015,-0.8572,0.0000,1.0000,-0.0018,0.8572,0.0009,0.5150},
-{2252.9377,36.8176,185.0643,0.5150,-0.0010,-0.8572,0.0000,1.0000,-0.0011,0.8572,0.0006,0.5150},
-{2265.7749,36.8176,177.3526,0.5150,-0.0006,-0.8572,0.0000,1.0000,-0.0007,0.8572,0.0004,0.5150},
-{2280.7393,36.8176,168.3674,0.5150,-0.0004,-0.8572,0.0000,1.0000,-0.0005,0.8572,0.0002,0.5150},
-{2294.6421,36.8176,160.0177,0.5150,-0.0003,-0.8572,0.0000,1.0000,-0.0003,0.8572,0.0002,0.5150},
-{2307.4780,36.8176,152.3055,0.5150,-0.0002,-0.8572,0.0000,1.0000,-0.0002,0.8572,0.0001,0.5150},
-{2319.2515,36.8176,145.2307,0.5150,-0.0001,-0.8572,0.0000,1.0000,-0.0001,0.8572,0.0001,0.5150},
-{2332.0884,36.8176,137.5143,0.5150,-0.0001,-0.8572,0.0000,1.0000,-0.0001,0.8572,0.0000,0.5150},
-{2344.9221,36.8176,129.7987,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2357.7549,36.8176,122.0830,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2370.5886,36.8176,114.3664,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2383.4268,36.8176,106.6523,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2398.3882,36.8176,97.6588,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2411.2249,36.8176,89.9446,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2424.0637,36.8176,82.2311,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2436.9019,36.8176,74.5168,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2449.7400,36.8176,66.8011,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2464.7021,36.8176,57.8053,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2477.5364,36.8176,50.0916,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2490.3760,36.8176,42.3770,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2502.1521,36.8176,35.3021,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2516.0562,36.8176,26.9475,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2532.0725,36.8176,17.3180,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2548.8318,36.8291,7.2630,0.5109,0.0007,-0.8596,-0.0048,1.0000,-0.0021,0.8596,0.0052,0.5109},
-{2561.6426,36.8176,-0.4301,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2575.5454,36.8176,-8.7780,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2589.4438,36.8176,-17.1254,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2601.2175,36.8176,-24.1983,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2614.0581,36.8176,-31.9105,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2625.8325,36.8176,-38.9841,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2638.6702,36.8176,-46.6993,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2651.5083,36.8176,-54.4173,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2666.4619,36.8176,-63.4083,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2679.2979,36.8176,-71.1212,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2692.1353,36.8176,-78.8350,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2706.0354,36.8176,-87.1860,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2720.9993,36.8176,-96.1796,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2733.8367,36.8176,-103.8967,0.5150,-0.0000,-0.8572,-0.0000,1.0000,-0.0000,0.8572,-0.0000,0.5150},
-{2747.7346,36.8176,-112.2512,0.5150,-0.0000,-0.8572,-0.0000,1.0000,-0.0000,0.8572,-0.0000,0.5150},
-{2759.5085,36.8176,-119.3241,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2774.4734,36.8176,-128.3145,0.5150,0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2788.3701,36.8176,-136.6720,0.5150,-0.0000,-0.8572,0.0000,1.0000,0.0000,0.8572,0.0000,0.5150},
-{2802.2654,36.8176,-145.0280,0.5150,0.0000,-0.8572,0.0000,1.0000,0.0000,0.8572,0.0000,0.5150},
-{2816.1660,36.8176,-153.3843,0.5150,-0.0000,-0.8572,0.0000,1.0000,-0.0000,0.8572,0.0000,0.5150},
-{2829.0000,36.8176,-161.0989,0.5150,-0.0000,-0.8572,0.0000,1.0000,0.0000,0.8572,0.0000,0.5150},
-{2842.8994,36.8178,-169.4517,0.5150,-0.0000,-0.8572,-0.0000,1.0000,-0.0000,0.8572,-0.0000,0.5150},
-{2858.2764,36.8180,-174.8842,0.4383,-0.0000,-0.8988,-0.0000,1.0000,0.0000,0.8988,0.0000,0.4383},
-{2875.0737,36.8180,-183.0861,0.4383,-0.0000,-0.8988,0.0000,1.0000,0.0000,0.8988,0.0000,0.4383},
-{2888.5273,36.8180,-189.6512,0.4383,-0.0000,-0.8988,-0.0000,1.0000,-0.0000,0.8988,0.0000,0.4383},
-{2901.9863,36.8180,-196.2199,0.4383,-0.0000,-0.8988,-0.0000,1.0000,0.0000,0.8988,0.0000,0.4383},
-{2915.4458,36.8180,-202.7902,0.4383,-0.0000,-0.8988,-0.0000,1.0000,0.0000,0.8988,0.0000,0.4383},
-{2928.9038,36.8180,-209.3602,0.4383,-0.0000,-0.8988,-0.0000,1.0000,-0.0000,0.8988,0.0000,0.4383},
-{2943.3855,36.8621,-216.7702,0.4099,0.0000,-0.9121,-0.0000,1.0000,-0.0000,0.9121,-0.0000,0.4099},
-{2957.1182,36.8182,-222.7549,0.3915,-0.0000,-0.9202,-0.0000,1.0000,-0.0000,0.9202,0.0000,0.3915},
-{2972.7810,36.8182,-227.1998,0.3583,-0.0000,-0.9336,0.0000,1.0000,0.0000,0.9336,0.0000,0.3583},
-{2986.7734,36.9060,-232.5751,0.3583,-0.0000,-0.9336,0.0000,1.0000,0.0000,0.9336,0.0000,0.3583},
-{3001.9109,36.9061,-238.3945,0.3583,-0.0000,-0.9336,-0.0000,1.0000,0.0000,0.9336,0.0000,0.3583},
-{3014.7917,36.8623,-243.1605,0.3407,0.0000,-0.9402,-0.0000,1.0000,-0.0000,0.9402,-0.0000,0.3407},
-{3027.7373,36.8184,-247.7486,0.3294,0.0000,-0.9442,-0.0000,1.0000,-0.0000,0.9442,-0.0000,0.3294},
-{3041.8999,36.8184,-252.6203,0.3221,-0.0000,-0.9467,-0.0000,1.0000,-0.0000,0.9467,0.0000,0.3221},
-{3054.9187,36.8184,-257.0050,0.3174,0.0000,-0.9483,-0.0000,1.0000,-0.0000,0.9483,-0.0000,0.3174},
-{3069.6331,36.8184,-260.4434,0.3583,0.0000,-0.9336,-0.0000,1.0000,-0.0000,0.9336,-0.0000,0.3583},
-{3083.9087,36.8184,-265.1552,0.3486,-0.0000,-0.9373,-0.0000,1.0000,-0.0000,0.9373,-0.0000,0.3486},
-{3097.9929,36.8184,-270.2546,0.3344,0.0000,-0.9424,-0.0000,1.0000,-0.0000,0.9424,-0.0000,0.3344},
-{3112.1538,36.8186,-275.1320,0.3154,-0.0000,-0.9490,-0.0000,1.0000,-0.0000,0.9490,0.0000,0.3154},
-{3126.9817,36.8187,-277.6512,0.2588,-0.0000,-0.9659,-0.0000,1.0000,-0.0000,0.9659,-0.0000,0.2588},
-{3141.3271,36.8187,-282.0258,0.2588,0.0000,-0.9659,-0.0000,1.0000,-0.0000,0.9659,-0.0000,0.2588},
-{3155.7886,36.8187,-285.9067,0.2588,0.0000,-0.9659,-0.0000,1.0000,-0.0000,0.9659,-0.0000,0.2588},
-{3169.0574,36.8187,-289.4658,0.2588,0.0000,-0.9659,-0.0000,1.0000,-0.0000,0.9659,-0.0000,0.2588},
-{3183.5244,36.8187,-293.3445,0.2588,-0.0000,-0.9659,-0.0000,1.0000,-0.0000,0.9659,0.0000,0.2588},
-{3197.9951,36.8187,-297.2240,0.2588,0.0000,-0.9659,-0.0000,1.0000,-0.0000,0.9659,-0.0000,0.2588},
-{3212.4504,36.8195,-301.1073,0.2588,0.0000,-0.9659,-0.0000,1.0000,-0.0000,0.9659,-0.0000,0.2588},
-{3226.9719,36.8203,-304.8438,0.2406,0.0000,-0.9706,-0.0000,1.0000,-0.0000,0.9706,-0.0000,0.2406},
-{3242.0154,36.8203,-306.1024,0.2079,-0.0000,-0.9781,0.0000,1.0000,0.0000,0.9781,0.0000,0.2079},
-{3256.4304,36.9081,-310.3600,0.2079,-0.0000,-0.9781,0.0000,1.0000,0.0000,0.9781,0.0000,0.2079},
-{3269.8716,36.8203,-313.2240,0.2079,0.0000,-0.9781,0.0000,1.0000,-0.0000,0.9781,0.0000,0.2079},
-{3285.7393,36.8203,-316.6048,0.2079,0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,-0.0000,0.2079},
-{3299.1755,36.8203,-319.4640,0.2079,-0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,0.0000,0.2079},
-{3313.8279,36.8203,-322.5833,0.2079,0.0000,-0.9781,0.0000,1.0000,-0.0000,0.9781,0.0000,0.2079},
-{3328.4810,36.8203,-325.7009,0.2079,-0.0000,-0.9781,0.0000,1.0000,0.0000,0.9781,0.0000,0.2079},
-{3341.9165,36.8203,-328.5602,0.2079,0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,-0.0000,0.2079},
-{3357.7830,36.8203,-331.9355,0.2079,0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,-0.0000,0.2079},
-{3371.2188,36.8203,-334.7949,0.2079,0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,-0.0000,0.2079},
-{3387.0898,36.8203,-338.1672,0.2079,-0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,0.0000,0.2079},
-{3401.7410,36.8203,-341.2856,0.2079,0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,-0.0000,0.2079},
-{3416.3960,36.8203,-344.4016,0.2079,-0.0000,-0.9781,-0.0000,1.0000,0.0000,0.9781,0.0000,0.2079},
-{3432.2595,36.8203,-347.7742,0.2079,0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,-0.0000,0.2079},
-{3446.9099,36.8203,-350.8879,0.2079,0.0000,-0.9781,0.0000,1.0000,-0.0000,0.9781,0.0000,0.2079},
-{3462.7766,36.8203,-354.2621,0.2079,-0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,-0.0000,0.2079},
-{3479.8555,36.8203,-357.8952,0.2079,-0.0000,-0.9781,-0.0000,1.0000,0.0000,0.9781,-0.0000,0.2079},
-{3494.5068,36.8203,-361.0117,0.2079,-0.0000,-0.9781,-0.0000,1.0000,0.0000,0.9781,0.0000,0.2079},
-{3507.9436,36.8203,-363.8675,0.2079,-0.0000,-0.9781,-0.0000,1.0000,0.0000,0.9781,0.0000,0.2079},
-{3523.8110,36.8203,-367.2425,0.2079,-0.0000,-0.9781,-0.0000,1.0000,0.0000,0.9781,0.0000,0.2079},
-{3539.6775,36.8203,-370.6164,0.2079,-0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,0.0000,0.2079},
-{3555.5396,36.8203,-373.9935,0.2079,-0.0000,-0.9781,0.0000,1.0000,0.0000,0.9781,0.0000,0.2079},
-{3568.9744,36.8203,-376.8520,0.2079,-0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,0.0000,0.2079},
-{3584.8425,36.8203,-380.2264,0.2079,-0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,-0.0000,0.2079},
-{3600.7046,36.8203,-383.5990,0.2079,-0.0000,-0.9781,0.0000,1.0000,0.0000,0.9781,0.0000,0.2079},
-{3615.3564,36.8203,-386.7119,0.2079,0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,-0.0000,0.2079},
-{3628.7913,36.8203,-389.5685,0.2079,0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,-0.0000,0.2079},
-{3644.6650,36.8203,-392.9419,0.2079,-0.0000,-0.9781,-0.0000,1.0000,0.0000,0.9781,-0.0000,0.2079},
-{3660.5286,36.8203,-396.3167,0.2079,-0.0000,-0.9781,0.0000,1.0000,0.0000,0.9781,0.0000,0.2079},
-{3676.3960,36.8203,-399.6903,0.2079,-0.0000,-0.9781,0.0000,1.0000,0.0000,0.9781,0.0000,0.2079},
-{3689.8311,36.8203,-402.5481,0.2079,-0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,0.0000,0.2079},
-{3704.4866,36.8203,-405.6617,0.2079,-0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,-0.0000,0.2079},
-{3717.9221,36.8203,-408.5192,0.2079,0.0000,-0.9781,0.0000,1.0000,-0.0000,0.9781,0.0000,0.2079},
-{3732.5776,36.8203,-411.6327,0.2079,-0.0000,-0.9781,-0.0000,1.0000,0.0000,0.9781,0.0000,0.2079},
-{3746.0137,36.8203,-414.4912,0.2079,-0.0000,-0.9781,-0.0000,1.0000,0.0000,0.9781,0.0000,0.2079},
-{3760.6680,36.8203,-417.6064,0.2079,0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,-0.0000,0.2079},
-{3774.1099,36.8203,-420.4593,0.2079,-0.0000,-0.9781,0.0000,1.0000,0.0000,0.9781,0.0000,0.2079},
-{3788.7605,36.8203,-423.5761,0.2079,0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,-0.0000,0.2079},
-{3802.1965,36.8203,-426.4315,0.2079,0.0000,-0.9781,0.0000,1.0000,-0.0000,0.9781,0.0000,0.2079},
-{3815.6338,36.8203,-429.2866,0.2079,-0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,0.0000,0.2079},
-{3830.2876,36.8203,-432.4050,0.2079,-0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,0.0000,0.2079},
-{3844.9387,36.8203,-435.5215,0.2079,0.0000,-0.9781,0.0000,1.0000,-0.0000,0.9781,0.0000,0.2079},
-{3858.3735,36.8203,-438.3794,0.2079,-0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,0.0000,0.2079},
-{3875.4568,36.8203,-442.0103,0.2079,-0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,0.0000,0.2079},
-{3888.8904,36.8203,-444.8690,0.2079,0.0000,-0.9781,0.0000,1.0000,-0.0000,0.9781,0.0000,0.2079},
-{3903.5415,36.8203,-447.9835,0.2079,0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,-0.0000,0.2079},
-{3916.9805,36.8203,-450.8411,0.2079,-0.0000,-0.9781,-0.0000,1.0000,0.0000,0.9781,0.0000,0.2079},
-{3930.4172,36.8203,-453.7007,0.2079,-0.0000,-0.9781,0.0000,1.0000,0.0000,0.9781,0.0000,0.2079},
-{3945.0710,36.8203,-456.8185,0.2079,-0.0000,-0.9781,0.0000,1.0000,0.0000,0.9781,0.0000,0.2079},
-{3958.5066,36.8203,-459.6763,0.2079,0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,-0.0000,0.2079},
-{3973.1631,36.8203,-462.7928,0.2079,0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,-0.0000,0.2079},
-{3987.8164,36.8203,-465.9102,0.2079,0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,-0.0000,0.2079},
-{4002.4709,36.8203,-469.0261,0.2079,0.0000,-0.9781,0.0000,1.0000,-0.0000,0.9781,0.0000,0.2079},
-{4015.9060,36.8203,-471.8834,0.2079,0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,-0.0000,0.2079},
-{4030.5586,36.8203,-474.9991,0.2079,-0.0000,-0.9781,-0.0000,1.0000,0.0000,0.9781,0.0000,0.2079},
-{4043.9941,36.8203,-477.8570,0.2079,-0.0000,-0.9781,0.0000,1.0000,0.0000,0.9781,0.0000,0.2079},
-{4058.6477,36.8203,-480.9751,0.2079,-0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,0.0000,0.2079},
-{4072.0833,36.8203,-483.8311,0.2079,-0.0000,-0.9781,-0.0000,1.0000,0.0000,0.9781,0.0000,0.2079},
-{4086.7346,36.8203,-486.9460,0.2079,0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,-0.0000,0.2079},
-{4100.1699,36.8203,-489.8012,0.2079,0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,-0.0000,0.2079},
-{4114.8237,36.8203,-492.9168,0.2079,0.0000,-0.9781,-0.0000,1.0000,-0.0000,0.9781,-0.0000,0.2079},
-{4129.4775,36.8211,-496.0335,0.2079,-0.0000,-0.9781,-0.0000,1.0000,0.0000,0.9781,0.0000,0.2079},
-{4144.1631,36.8219,-498.9920,0.1895,0.0000,-0.9819,0.0000,1.0000,0.0000,0.9819,0.0000,0.1895},
-{4159.1973,36.8219,-500.1826,0.1776,-0.0000,-0.9841,-0.0000,1.0000,0.0000,0.9841,0.0000,0.1776},
-{4173.9614,36.8658,-502.7789,0.1700,0.0000,-0.9854,0.0000,1.0000,-0.0000,0.9854,0.0000,0.1700},
-{4188.7236,36.8219,-505.2849,0.1651,-0.0000,-0.9863,-0.0000,1.0000,-0.0000,0.9863,0.0000,0.1651},
-{4203.5010,36.8219,-507.7292,0.1620,0.0000,-0.9868,0.0000,1.0000,-0.0000,0.9868,0.0000,0.1620},
-{4220.7354,36.8219,-510.5390,0.1600,0.0000,-0.9871,0.0000,1.0000,0.0000,0.9871,0.0000,0.1600},
-{4236.7437,36.8221,-513.1253,0.1587,-0.0000,-0.9873,-0.0000,1.0000,0.0000,0.9873,0.0000,0.1587},
-{4251.5596,36.8223,-515.3286,0.1393,-0.0000,-0.9903,-0.0000,1.0000,0.0000,0.9903,0.0000,0.1393},
-{4265.3711,36.8223,-515.3145,0.1046,-0.0000,-0.9945,0.0000,1.0000,0.0000,0.9945,0.0000,0.1046},
-{4280.2231,36.8222,-517.3985,0.1046,0.0000,-0.9945,0.0000,1.0000,-0.0000,0.9945,0.0000,0.1046},
-{4293.8789,36.8223,-518.8392,0.1046,0.0000,-0.9945,-0.0000,1.0000,-0.0000,0.9945,-0.0000,0.1046},
-{4307.5381,36.8223,-520.2772,0.1046,-0.0000,-0.9945,-0.0000,1.0000,0.0000,0.9945,0.0000,0.1046},
-{4321.2012,36.8223,-521.7123,0.1046,-0.0000,-0.9945,-0.0000,1.0000,0.0000,0.9945,-0.0000,0.1046},
-{4334.8647,36.8222,-523.1511,0.1046,0.0000,-0.9945,-0.0000,1.0000,-0.0000,0.9945,-0.0000,0.1046},
-{4349.7627,36.8663,-524.7217,0.1046,0.0000,-0.9945,0.0000,1.0000,-0.0000,0.9945,0.0000,0.1046},
-{4365.7964,36.8665,-527.1254,0.1233,-0.0000,-0.9924,0.0000,1.0000,0.0000,0.9924,0.0000,0.1233},
-{4380.5703,36.8665,-529.5955,0.1352,-0.0000,-0.9908,-0.0000,1.0000,0.0000,0.9908,0.0000,0.1352},
-{4394.1714,36.9104,-531.5236,0.1429,-0.0000,-0.9897,-0.0000,1.0000,0.0000,0.9897,0.0000,0.1429},
-{4407.6841,36.9104,-534.0259,0.1478,0.0000,-0.9890,0.0000,1.0000,0.0000,0.9890,0.0000,0.1478},
-{4421.2656,36.8665,-536.0836,0.1509,0.0000,-0.9885,-0.0000,1.0000,-0.0000,0.9885,-0.0000,0.1509},
-{4436.0752,36.8665,-538.3607,0.1529,-0.0000,-0.9882,-0.0000,1.0000,0.0000,0.9882,0.0000,0.1529},
-{4450.8779,36.9104,-540.6572,0.1542,0.0000,-0.9880,0.0000,1.0000,-0.0000,0.9880,0.0000,0.1542},
-{4464.4468,36.9106,-542.8330,0.1653,0.0000,-0.9862,-0.0000,1.0000,-0.0000,0.9862,-0.0000,0.1653},
-{4479.0869,36.9108,-545.9755,0.1807,0.0000,-0.9835,-0.0000,1.0000,-0.0000,0.9835,-0.0000,0.1807},
-{4493.6958,36.8669,-549.2839,0.1905,-0.0000,-0.9817,-0.0000,1.0000,-0.0000,0.9817,-0.0000,0.1905},
-{4507.0669,36.9108,-552.4418,0.1968,0.0000,-0.9804,0.0000,1.0000,-0.0000,0.9804,0.0000,0.1968},
-{4521.7427,36.8669,-555.4205,0.2008,0.0000,-0.9796,0.0000,1.0000,-0.0000,0.9796,0.0000,0.2008},
-{4535.1929,36.9108,-558.1968,0.2034,-0.0000,-0.9791,-0.0000,1.0000,0.0000,0.9791,0.0000,0.2034},
-{4549.8604,36.9108,-561.2543,0.2050,-0.0000,-0.9788,-0.0000,1.0000,0.0000,0.9788,0.0000,0.2050},
-{4563.3008,36.9109,-564.0774,0.2061,0.0000,-0.9785,0.0000,1.0000,-0.0000,0.9785,0.0000,0.2061},
-{4576.3521,36.8233,-568.1929,0.2434,-0.0000,-0.9699,-0.0000,1.0000,0.0000,0.9699,0.0000,0.2434},
-{4590.5103,36.8233,-573.0014,0.2672,-0.0000,-0.9636,-0.0000,1.0000,0.0000,0.9636,-0.0000,0.2672},
-{4603.5557,36.8672,-577.2822,0.2823,-0.0000,-0.9593,-0.0000,1.0000,-0.0000,0.9593,-0.0000,0.2823},
-{4617.8989,36.9111,-581.5893,0.2920,-0.0000,-0.9564,-0.0000,1.0000,0.0000,0.9564,0.0000,0.2920},
-{4632.0532,36.8672,-586.4956,0.2981,-0.0000,-0.9545,-0.0000,1.0000,0.0000,0.9545,0.0000,0.2981},
-{4646.3389,36.9111,-590.9890,0.3021,0.0000,-0.9533,-0.0000,1.0000,-0.0000,0.9533,-0.0000,0.3021},
-{4661.8003,36.9111,-595.9019,0.3046,-0.0000,-0.9525,-0.0000,1.0000,0.0000,0.9525,0.0000,0.3046},
-{4675.9087,36.8843,-600.9383,0.3062,-0.0017,-0.9520,-0.0000,1.0000,-0.0017,0.9520,0.0005,0.3062},
-{4690.1587,37.1094,-605.5151,0.3072,-0.0070,-0.9516,-0.0000,1.0000,-0.0074,0.9516,0.0023,0.3072},
-{4703.2285,37.3933,-609.7332,0.3078,-0.0105,-0.9514,-0.0000,0.9999,-0.0110,0.9514,0.0034,0.3078},
-{4716.2983,37.6334,-613.9635,0.3083,-0.0127,-0.9512,-0.0000,0.9999,-0.0134,0.9513,0.0041,0.3082},
-{4731.7261,37.9169,-618.9597,0.3085,-0.0141,-0.9511,-0.0000,0.9999,-0.0148,0.9512,0.0046,0.3085},
-{4745.9746,38.1789,-623.5772,0.3087,-0.0150,-0.9510,-0.0000,0.9999,-0.0158,0.9512,0.0049,0.3087},
-{4760.2188,38.4407,-628.1953,0.3088,-0.0156,-0.9510,-0.0000,0.9999,-0.0164,0.9511,0.0051,0.3088},
-{4773.2827,38.6808,-632.4330,0.3089,-0.0160,-0.9510,-0.0000,0.9999,-0.0168,0.9511,0.0052,0.3088},
-{4787.5259,39.0333,-637.0537,0.3089,-0.0192,-0.9509,-0.0000,0.9998,-0.0202,0.9511,0.0063,0.3089},
-{4801.7734,39.5495,-641.6678,0.3090,-0.0242,-0.9508,-0.0000,0.9997,-0.0255,0.9511,0.0079,0.3089},
-{4816.0229,40.0718,-646.2928,0.3090,-0.0274,-0.9507,0.0000,0.9996,-0.0288,0.9511,0.0089,0.3089},
-{4830.2681,40.6382,-650.9174,0.3090,-0.0295,-0.9506,0.0000,0.9995,-0.0310,0.9511,0.0096,0.3088},
-{4843.3281,41.0732,-655.1592,0.3090,-0.0308,-0.9506,0.0000,0.9995,-0.0324,0.9511,0.0100,0.3088},
-{4858.7563,41.6831,-660.1677,0.3090,-0.0317,-0.9505,0.0000,0.9994,-0.0333,0.9511,0.0103,0.3088},
-{4872.9946,42.2053,-664.7886,0.3090,-0.0322,-0.9505,0.0000,0.9994,-0.0339,0.9511,0.0104,0.3088},
-{4887.2334,42.7403,-669.4059,0.3090,-0.0342,-0.9504,0.0000,0.9994,-0.0360,0.9511,0.0111,0.3088},
-{4901.4678,43.4392,-674.0195,0.3090,-0.0385,-0.9503,0.0000,0.9992,-0.0405,0.9511,0.0125,0.3088},
-{4914.5205,44.1581,-678.2570,0.3090,-0.0425,-0.9501,-0.0000,0.9990,-0.0447,0.9511,0.0138,0.3087},
-{4928.7515,44.9417,-682.8747,0.3090,-0.0451,-0.9500,-0.0000,0.9989,-0.0475,0.9511,0.0147,0.3087},
-{4941.8027,45.6609,-687.1101,0.3090,-0.0468,-0.9499,-0.0000,0.9988,-0.0492,0.9511,0.0152,0.3086},
-{4954.8540,46.3799,-691.3460,0.3090,-0.0479,-0.9499,-0.0000,0.9987,-0.0503,0.9511,0.0156,0.3086},
-{4969.0859,47.1640,-695.9651,0.3090,-0.0486,-0.9498,-0.0000,0.9987,-0.0511,0.9511,0.0158,0.3086},
-{4982.1348,47.8829,-700.2028,0.3090,-0.0490,-0.9498,-0.0000,0.9987,-0.0515,0.9511,0.0159,0.3086},
-{4996.3569,48.6674,-704.8208,0.3090,-0.0493,-0.9498,-0.0000,0.9987,-0.0518,0.9511,0.0160,0.3086},
-{5010.5806,49.4514,-709.4415,0.3090,-0.0495,-0.9498,-0.0000,0.9986,-0.0520,0.9511,0.0161,0.3086},
-{5023.6255,50.1705,-713.6738,0.3090,-0.0496,-0.9498,-0.0000,0.9986,-0.0521,0.9511,0.0161,0.3086},
-{5037.8457,50.9542,-718.2958,0.3090,-0.0496,-0.9498,-0.0000,0.9986,-0.0522,0.9511,0.0161,0.3086},
-{5052.0645,51.7378,-722.9188,0.3090,-0.0497,-0.9498,-0.0000,0.9986,-0.0522,0.9511,0.0162,0.3086},
-{5066.2852,52.5215,-727.5464,0.3090,-0.0497,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5080.5068,53.3053,-732.1788,0.3090,-0.0497,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5093.5498,54.0242,-736.4271,0.3090,-0.0497,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5108.9438,54.8725,-741.4540,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5121.9834,55.5918,-745.7094,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5136.1982,56.3755,-750.3547,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5150.4150,57.1594,-755.0061,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5164.6304,57.8551,-759.6438,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5178.8491,58.6386,-764.2724,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5191.8872,59.3568,-768.5133,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5206.1074,60.1401,-773.1352,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5220.3188,60.9677,-777.7538,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5234.5381,61.7071,-782.3736,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5249.9380,62.5996,-787.3726,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5265.3325,63.4481,-792.3735,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5280.7344,64.2964,-797.3785,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5294.9521,65.0363,-801.9991,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5309.1724,65.8198,-806.6226,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5323.3921,66.6036,-811.2449,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5336.4321,67.3220,-815.4841,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5349.4736,68.0408,-819.7224,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5362.5137,68.7591,-823.9623,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5377.9102,69.6078,-828.9649,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5392.1313,70.3915,-833.5895,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5406.3481,71.1750,-838.2122,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5421.7393,72.0226,-843.2181,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5437.1343,72.8713,-848.2242,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5451.3521,73.6550,-852.8466,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5467.9219,74.5678,-858.2344,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5482.1416,75.3517,-862.8536,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5495.1826,76.0703,-867.0901,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5509.3999,76.8538,-871.7113,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5525.9653,77.7662,-877.0984,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5540.1860,78.5503,-881.7225,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5553.2261,79.2689,-885.9597,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5567.4443,80.0524,-890.5822,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5580.4839,80.7709,-894.8194,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5595.8813,81.6194,-899.8196,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5608.9292,82.3383,-904.0590,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5621.9717,83.0571,-908.2956,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5635.0132,83.7756,-912.5322,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5650.4102,84.6237,-917.5346,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5663.4526,85.3424,-921.7729,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5676.4932,86.0611,-926.0110,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5690.7144,86.8450,-930.6334,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5704.9326,87.6285,-935.2567,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5717.9717,88.3470,-939.4973,0.3090,-0.0498,-0.9498,-0.0000,0.9986,-0.0523,0.9511,0.0162,0.3086},
-{5733.3726,89.0546,-944.5023,0.3090,-0.0451,-0.9500,-0.0000,0.9989,-0.0474,0.9511,0.0147,0.3087},
-{5746.4194,89.5335,-948.7427,0.3090,-0.0408,-0.9502,0.0000,0.9991,-0.0429,0.9511,0.0133,0.3087},
-{5760.6436,90.0557,-953.3638,0.3090,-0.0381,-0.9503,0.0000,0.9992,-0.0400,0.9511,0.0124,0.3088},
-{5774.8677,90.5775,-957.9843,0.3090,-0.0363,-0.9504,0.0000,0.9993,-0.0382,0.9511,0.0118,0.3088},
-{5789.0938,91.0994,-962.6086,0.3090,-0.0352,-0.9504,0.0000,0.9993,-0.0370,0.9511,0.0114,0.3088},
-{5802.1445,91.4629,-966.8510,0.3090,-0.0298,-0.9506,0.0000,0.9995,-0.0313,0.9511,0.0097,0.3089},
-{5816.3784,91.7249,-971.4785,0.3090,-0.0251,-0.9507,-0.0000,0.9997,-0.0264,0.9511,0.0082,0.3089},
-{5829.4238,91.9650,-975.7162,0.3090,-0.0220,-0.9508,-0.0000,0.9997,-0.0232,0.9511,0.0072,0.3089},
-{5843.6562,92.2267,-980.3364,0.3090,-0.0201,-0.9509,-0.0000,0.9998,-0.0211,0.9511,0.0065,0.3089},
-{5856.7163,92.4667,-984.5760,0.3090,-0.0188,-0.9509,-0.0000,0.9998,-0.0198,0.9511,0.0061,0.3089},
-{5870.9585,92.6353,-989.2043,0.3090,-0.0150,-0.9509,-0.0000,0.9999,-0.0158,0.9511,0.0049,0.3090},
-{5884.0161,92.6391,-993.4481,0.3090,-0.0096,-0.9510,-0.0000,0.9999,-0.0101,0.9511,0.0031,0.3090},
-{5898.2563,92.6391,-998.0729,0.3090,-0.0062,-0.9510,-0.0000,1.0000,-0.0065,0.9510,0.0020,0.3090},
-{5912.4927,92.6391,-1002.6976,0.3090,-0.0039,-0.9510,-0.0000,1.0000,-0.0041,0.9510,0.0013,0.3090},
-{5926.7344,92.6392,-1007.3265,0.3091,-0.0025,-0.9510,-0.0000,1.0000,-0.0027,0.9510,0.0008,0.3091},
-{5942.1016,92.6832,-1012.5159,0.3269,-0.0016,-0.9451,0.0000,1.0000,-0.0017,0.9451,0.0005,0.3269},
-{5956.0308,92.6832,-1018.0049,0.3383,-0.0010,-0.9410,0.0000,1.0000,-0.0011,0.9411,0.0003,0.3383},
-{5971.0942,92.6832,-1024.0221,0.3455,-0.0007,-0.9384,0.0000,1.0000,-0.0007,0.9384,0.0002,0.3455},
-{5987.4624,92.7271,-1030.0946,0.3501,-0.0004,-0.9367,0.0000,1.0000,-0.0004,0.9367,0.0001,0.3501},
-{6004.7207,92.6833,-1037.2212,0.3629,-0.0003,-0.9318,0.0000,1.0000,-0.0003,0.9318,0.0001,0.3629},
-{6019.5757,92.6833,-1043.7194,0.3788,-0.0002,-0.9255,0.0000,1.0000,-0.0002,0.9255,0.0001,0.3788},
-{6035.4819,92.6834,-1050.8984,0.3889,-0.0001,-0.9213,0.0000,1.0000,-0.0001,0.9213,0.0000,0.3889},
-{6051.3418,92.6834,-1058.1927,0.3953,-0.0001,-0.9185,0.0000,1.0000,-0.0001,0.9185,0.0000,0.3953},
-{6066.2031,92.7273,-1064.6840,0.4090,-0.0000,-0.9125,0.0000,1.0000,-0.0000,0.9125,0.0000,0.4090},
-{6079.5640,92.7274,-1071.4254,0.4253,-0.0000,-0.9050,0.0000,1.0000,-0.0000,0.9050,0.0000,0.4253},
-{6095.0801,92.7274,-1079.4263,0.4357,-0.0000,-0.9001,0.0000,1.0000,-0.0000,0.9001,0.0000,0.4357},
-{6110.5308,92.6835,-1087.5471,0.4423,-0.0000,-0.8969,0.0000,1.0000,-0.0000,0.8969,0.0000,0.4423},
-{6123.9526,92.7275,-1094.2009,0.4465,-0.0000,-0.8948,0.0000,1.0000,-0.0000,0.8948,0.0000,0.4465},
-{6137.8564,92.6836,-1102.4919,0.4660,-0.0000,-0.8848,0.0000,1.0000,-0.0000,0.8848,0.0000,0.4660},
-{6152.9829,92.6836,-1111.1801,0.4783,-0.0000,-0.8782,0.0000,1.0000,-0.0000,0.8782,0.0000,0.4783},
-{6168.0259,92.7275,-1120.0200,0.4862,-0.0000,-0.8739,0.0000,1.0000,-0.0000,0.8739,0.0000,0.4862},
-{6181.0942,92.6836,-1127.3400,0.4912,-0.0000,-0.8711,0.0000,1.0000,-0.0000,0.8711,0.0000,0.4912},
-{6194.8950,92.6838,-1135.8195,0.5034,-0.0000,-0.8640,0.0000,1.0000,-0.0000,0.8640,0.0000,0.5034},
-{6208.5537,92.6838,-1144.5350,0.5184,-0.0000,-0.8551,0.0000,1.0000,-0.0000,0.8551,0.0000,0.5184},
-{6223.1460,92.6838,-1154.0996,0.5279,-0.0000,-0.8493,0.0000,1.0000,-0.0000,0.8493,0.0000,0.5279},
-{6236.6187,92.6838,-1163.1241,0.5339,-0.0000,-0.8455,0.0000,1.0000,-0.0000,0.8455,0.0000,0.5339},
-{6250.2808,92.7277,-1171.8528,0.5466,-0.0000,-0.8374,0.0000,1.0000,-0.0000,0.8374,0.0000,0.5466},
-{6264.1763,92.6838,-1182.3956,0.5616,-0.0000,-0.8274,0.0000,1.0000,-0.0000,0.8274,0.0000,0.5616},
-{6276.2134,92.7277,-1191.2885,0.5711,-0.0000,-0.8209,0.0000,1.0000,-0.0000,0.8209,0.0000,0.5711},
-{6290.5122,92.7277,-1201.3091,0.5771,-0.0000,-0.8166,0.0000,1.0000,-0.0000,0.8166,0.0000,0.5771},
-{6303.4385,92.7278,-1211.1154,0.5810,-0.0000,-0.8139,0.0000,1.0000,-0.0000,0.8139,0.0000,0.5810},
-{6318.1758,92.6839,-1222.5785,0.5986,-0.0000,-0.8010,0.0000,1.0000,-0.0000,0.8010,0.0000,0.5986},
-{6330.7646,92.6839,-1232.7852,0.6098,-0.0000,-0.7926,0.0000,1.0000,-0.0000,0.7926,0.0000,0.6098},
-{6343.2554,92.6839,-1243.1342,0.6169,-0.0000,-0.7871,0.0000,1.0000,-0.0000,0.7871,0.0000,0.6169},
-{6357.6289,92.7278,-1255.0842,0.6214,-0.0000,-0.7835,0.0000,1.0000,-0.0000,0.7835,0.0000,0.6214},
-{6370.8203,92.6839,-1266.4905,0.6388,-0.0000,-0.7693,0.0000,1.0000,-0.0000,0.7693,0.0000,0.6388},
-{6381.9087,92.6839,-1276.5526,0.6499,-0.0000,-0.7600,0.0000,1.0000,-0.0000,0.7600,0.0000,0.6499},
-{6393.8477,92.7278,-1287.5239,0.6569,-0.0000,-0.7540,0.0000,1.0000,-0.0000,0.7540,0.0000,0.6569},
-{6406.0425,92.6839,-1298.2134,0.6613,-0.0000,-0.7501,0.0000,1.0000,-0.0000,0.7501,0.0000,0.6613},
-{6417.7812,92.6840,-1309.3801,0.6719,-0.0000,-0.7406,0.0000,1.0000,-0.0000,0.7406,0.0000,0.6719},
-{6429.3296,92.6840,-1320.7454,0.6848,-0.0000,-0.7288,0.0000,1.0000,-0.0000,0.7288,0.0000,0.6848},
-{6440.7148,92.6840,-1332.2834,0.6929,-0.0000,-0.7211,-0.0000,1.0000,-0.0000,0.7211,-0.0000,0.6929},
-{6451.1162,92.7279,-1343.0648,0.6980,-0.0000,-0.7161,-0.0000,1.0000,-0.0000,0.7161,-0.0000,0.6980},
-{6461.8159,92.6840,-1353.5439,0.7013,-0.0000,-0.7129,0.0000,1.0000,-0.0000,0.7129,-0.0000,0.7013},
-{6473.3652,92.7279,-1364.9324,0.7034,-0.0000,-0.7108,0.0000,1.0000,-0.0000,0.7108,-0.0000,0.7034},
-{6484.0073,92.7279,-1375.4803,0.7047,0.0000,-0.7095,0.0000,1.0000,-0.0000,0.7095,-0.0000,0.7047},
-{6495.1592,92.6401,-1387.2628,0.7056,-0.0000,-0.7086,-0.0000,1.0000,-0.0000,0.7086,-0.0000,0.7056},
-{6506.6455,92.6401,-1398.7019,0.7061,0.0000,-0.7081,0.0000,1.0000,-0.0000,0.7081,0.0000,0.7061},
-{6518.1240,92.6401,-1410.1464,0.7065,-0.0000,-0.7078,-0.0000,1.0000,0.0000,0.7078,0.0000,0.7065},
-{6529.5996,92.6401,-1421.5948,0.7067,-0.0000,-0.7075,-0.0000,1.0000,-0.0000,0.7075,-0.0000,0.7067},
-{6541.0771,92.6401,-1433.0491,0.7068,-0.0000,-0.7074,-0.0000,1.0000,-0.0000,0.7074,-0.0000,0.7068},
-{6552.5498,92.6401,-1444.5061,0.7069,0.0000,-0.7073,0.0000,1.0000,-0.0000,0.7073,-0.0000,0.7069},
-{6564.8970,92.6401,-1456.8429,0.7070,-0.0000,-0.7072,-0.0000,1.0000,-0.0000,0.7072,-0.0000,0.7070},
-{6575.4907,92.6401,-1467.4314,0.7070,-0.0000,-0.7072,0.0000,1.0000,0.0000,0.7072,0.0000,0.7070},
-{6586.0801,92.6401,-1478.0228,0.7070,0.0000,-0.7072,0.0000,1.0000,-0.0000,0.7072,0.0000,0.7070},
-{6596.6709,92.6401,-1488.6125,0.7071,0.0000,-0.7072,0.0000,1.0000,-0.0000,0.7072,0.0000,0.7071},
-{6608.1396,92.6401,-1500.0760,0.7071,0.0000,-0.7072,0.0000,1.0000,-0.0000,0.7072,0.0000,0.7071},
-{6619.6079,92.6401,-1511.5386,0.7071,0.0000,-0.7071,0.0000,1.0000,-0.0000,0.7071,0.0000,0.7071},
-{6630.1958,92.6401,-1522.1282,0.7071,0.0000,-0.7071,-0.0000,1.0000,-0.0000,0.7071,-0.0000,0.7071},
-{6640.7827,92.6401,-1532.7164,0.7071,-0.0000,-0.7071,0.0000,1.0000,-0.0000,0.7071,0.0000,0.7071},
-{6651.3730,92.6401,-1543.3033,0.7071,0.0000,-0.7071,0.0000,1.0000,-0.0000,0.7071,-0.0000,0.7071},
-{6661.9663,92.6401,-1553.8893,0.7071,-0.0000,-0.7071,0.0000,1.0000,0.0000,0.7071,0.0000,0.7071},
-{6672.5610,92.6401,-1564.4746,0.7071,-0.0000,-0.7071,-0.0000,1.0000,-0.0000,0.7071,-0.0000,0.7071},
-{6684.9116,92.6840,-1576.8137,0.7071,-0.0000,-0.7071,0.0000,1.0000,0.0000,0.7071,0.0000,0.7071},
-{6696.3799,92.6840,-1588.2744,0.7071,0.0000,-0.7071,0.0000,1.0000,-0.0000,0.7071,0.0000,0.7071},
-{6707.8511,92.6840,-1599.7344,0.7071,-0.0000,-0.7071,-0.0000,1.0000,-0.0000,0.7071,-0.0000,0.7071},
-{6718.4512,92.6840,-1610.3243,0.7071,0.0000,-0.7071,0.0000,1.0000,0.0000,0.7071,0.0000,0.7071},
-{6729.9253,92.6840,-1621.7887,0.7071,-0.0000,-0.7071,0.0000,1.0000,0.0000,0.7071,0.0000,0.7071},
-{6740.5195,92.6840,-1632.3760,0.7071,0.0000,-0.7071,0.0000,1.0000,-0.0000,0.7071,0.0000,0.7071},
-{6751.1147,92.6840,-1642.9613,0.7071,0.0000,-0.7071,0.0000,1.0000,-0.0000,0.7071,-0.0000,0.7071},
-{6762.5850,92.6840,-1654.4261,0.7071,-0.0000,-0.7071,-0.0000,1.0000,0.0000,0.7071,0.0000,0.7071},
-{6772.3003,92.6840,-1664.1357,0.7071,-0.0000,-0.7071,-0.0000,1.0000,-0.0000,0.7071,-0.0000,0.7071},
-{6783.7715,92.6840,-1675.5995,0.7071,-0.0000,-0.7071,-0.0000,1.0000,-0.0000,0.7071,-0.0000,0.7071},
-{6795.2441,92.6840,-1687.0634,0.7071,-0.0000,-0.7071,-0.0000,1.0000,-0.0000,0.7071,-0.0000,0.7071},
-{6806.7178,92.6840,-1698.5298,0.7071,-0.0000,-0.7071,0.0000,1.0000,-0.0000,0.7071,0.0000,0.7071},
-{6818.1880,92.6840,-1709.9938,0.7071,0.0000,-0.7071,0.0000,1.0000,-0.0000,0.7071,-0.0000,0.7071},
-{6828.7817,92.7279,-1720.5831,0.7071,-0.0000,-0.7071,0.0000,1.0000,-0.0000,0.7071,0.0000,0.7071},
-{6839.3750,92.7279,-1731.1733,0.7071,-0.0000,-0.7071,0.0000,1.0000,-0.0000,0.7071,0.0000,0.7071},
-{6849.9663,92.7279,-1741.7584,0.7071,-0.0000,-0.7071,0.0000,1.0000,-0.0000,0.7071,0.0000,0.7071},
-{6860.5591,92.7279,-1752.3461,0.7071,-0.0000,-0.7071,0.0000,1.0000,0.0000,0.7071,0.0000,0.7071},
-{6871.1514,92.7279,-1762.9316,0.7071,-0.0000,-0.7071,0.0000,1.0000,0.0000,0.7071,0.0000,0.7071},
-{6881.7432,92.7279,-1773.5183,0.7071,-0.0000,-0.7071,-0.0000,1.0000,-0.0000,0.7071,-0.0000,0.7071},
-{6892.3379,92.7279,-1784.1046,0.7071,-0.0000,-0.7071,0.0000,1.0000,-0.0000,0.7071,0.0000,0.7071},
-{6903.8091,92.7279,-1795.5684,0.7071,-0.0000,-0.7071,-0.0000,1.0000,0.0000,0.7071,-0.0000,0.7071},
-{6915.2769,92.7279,-1807.0288,0.7071,-0.0000,-0.7071,0.0000,1.0000,0.0000,0.7071,0.0000,0.7071},
-{6926.7471,92.7279,-1818.4923,0.7071,-0.0000,-0.7071,0.0000,1.0000,0.0000,0.7071,0.0000,0.7071},
-{6938.2183,92.7279,-1829.9540,0.7071,0.0000,-0.7071,0.0000,1.0000,-0.0000,0.7071,-0.0000,0.7071},
-{6950.5654,92.7279,-1842.2915,0.7071,-0.0000,-0.7071,0.0000,1.0000,-0.0000,0.7071,0.0000,0.7071},
-{6962.0386,92.7280,-1853.7552,0.7071,-0.0000,-0.7071,0.0000,1.0000,-0.0000,0.7071,0.0000,0.7071},
-{6973.5073,92.7280,-1865.2162,0.7071,0.0000,-0.7071,0.0000,1.0000,-0.0000,0.7071,0.0000,0.7071},
-{6984.9795,92.7280,-1876.6792,0.7071,-0.0000,-0.7071,-0.0000,1.0000,-0.0000,0.7071,-0.0000,0.7071},
-{6997.3276,92.7280,-1889.0167,0.7071,-0.0000,-0.7071,0.0000,1.0000,0.0000,0.7071,0.0000,0.7071},
-{7008.8008,92.7280,-1900.4807,0.7071,-0.0000,-0.7071,0.0000,1.0000,-0.0000,0.7071,0.0000,0.7071},
-{7019.3701,92.6841,-1912.7397,0.7203,-0.0000,-0.6937,-0.0000,1.0000,-0.0000,0.6937,-0.0000,0.7203},
-{7030.1694,92.7280,-1924.8173,0.7286,0.0000,-0.6849,0.0000,1.0000,-0.0000,0.6849,0.0000,0.7286},
-{7041.2339,92.7280,-1936.6765,0.7339,-0.0000,-0.6793,0.0000,1.0000,0.0000,0.6793,0.0000,0.7339},
-{7051.8613,92.6402,-1948.9363,0.7372,0.0000,-0.6756,0.0000,1.0000,-0.0000,0.6756,0.0000,0.7372},
-{7062.2666,92.6841,-1961.3400,0.7519,-0.0000,-0.6592,0.0000,1.0000,-0.0000,0.6592,0.0000,0.7519},
-{7071.6431,92.6841,-1973.0081,0.7612,0.0000,-0.6486,0.0000,1.0000,-0.0000,0.6486,-0.0000,0.7612},
-{7081.7217,92.7020,-1985.7065,0.7670,0.0011,-0.6417,0.0000,1.0000,0.0017,0.6417,-0.0014,0.7670},
-{7092.0986,92.4464,-1998.1787,0.7707,0.0046,-0.6372,0.0001,1.0000,0.0074,0.6372,-0.0057,0.7706},
-{7102.4165,92.2076,-2010.7017,0.7730,0.0069,-0.6344,0.0001,0.9999,0.0110,0.6344,-0.0085,0.7730},
-{7111.5215,91.8941,-2022.5999,0.7745,0.0095,-0.6325,0.0001,0.9999,0.0151,0.6326,-0.0117,0.7744},
-{7121.7246,91.2872,-2035.0948,0.7755,0.0140,-0.6313,0.0001,0.9998,0.0222,0.6314,-0.0173,0.7753},
-{7131.9556,90.7211,-2047.6554,0.7761,0.0168,-0.6304,0.0000,0.9996,0.0268,0.6307,-0.0208,0.7758},
-{7142.1797,90.1101,-2060.2302,0.7765,0.0207,-0.6298,0.0000,0.9995,0.0328,0.6302,-0.0255,0.7760},
-{7151.6079,89.3349,-2071.8486,0.7767,0.0251,-0.6294,0.0000,0.9992,0.0398,0.6299,-0.0310,0.7761},
-{7162.5933,88.4205,-2085.3992,0.7769,0.0279,-0.6291,0.0000,0.9990,0.0443,0.6297,-0.0345,0.7761},
-{7173.5752,87.4984,-2098.9485,0.7770,0.0297,-0.6289,0.0000,0.9989,0.0472,0.6296,-0.0367,0.7761},
-{7183.7729,86.6504,-2111.5337,0.7770,0.0309,-0.6287,0.0000,0.9988,0.0490,0.6295,-0.0381,0.7761},
-{7193.1846,85.8671,-2123.1543,0.7771,0.0316,-0.6286,0.0000,0.9987,0.0502,0.6294,-0.0390,0.7761},
-{7202.5938,85.0839,-2134.7761,0.7771,0.0321,-0.6286,0.0000,0.9987,0.0510,0.6294,-0.0396,0.7761},
-{7212.7817,84.2358,-2147.3630,0.7771,0.0324,-0.6285,0.0000,0.9987,0.0514,0.6294,-0.0400,0.7761},
-{7222.1895,83.4527,-2158.9834,0.7771,0.0326,-0.6285,0.0000,0.9987,0.0518,0.6294,-0.0402,0.7761},
-{7231.5986,82.6697,-2170.6025,0.7771,0.0327,-0.6285,0.0000,0.9986,0.0519,0.6293,-0.0404,0.7761},
-{7241.0078,81.8866,-2182.2217,0.7771,0.0328,-0.6285,0.0000,0.9986,0.0521,0.6293,-0.0405,0.7761},
-{7251.1992,81.0382,-2194.8032,0.7771,0.0328,-0.6285,0.0000,0.9986,0.0522,0.6293,-0.0405,0.7761},
-{7259.8286,80.3207,-2205.4565,0.7771,0.0329,-0.6285,0.0000,0.9986,0.0522,0.6293,-0.0406,0.7761},
-{7270.0190,79.4724,-2218.0347,0.7771,0.0329,-0.6285,0.0000,0.9986,0.0522,0.6293,-0.0406,0.7761},
-{7279.4272,78.6899,-2229.6543,0.7771,0.0329,-0.6285,0.0000,0.9986,0.0523,0.6293,-0.0406,0.7761},
-{7288.8384,77.9068,-2241.2744,0.7771,0.0329,-0.6285,0.0000,0.9986,0.0523,0.6293,-0.0406,0.7761},
-{7298.2510,77.1238,-2252.8918,0.7771,0.0329,-0.6285,0.0000,0.9986,0.0523,0.6293,-0.0406,0.7761},
-{7308.4429,76.2757,-2265.4749,0.7771,0.0329,-0.6285,0.0000,0.9986,0.0523,0.6293,-0.0406,0.7761},
-{7318.6338,75.4276,-2278.0588,0.7771,0.0329,-0.6285,0.0000,0.9986,0.0523,0.6293,-0.0406,0.7761},
-{7328.8237,74.5792,-2290.6433,0.7771,0.0329,-0.6285,0.0000,0.9986,0.0523,0.6293,-0.0406,0.7761},
-{7338.2319,73.7966,-2302.2622,0.7771,0.0329,-0.6285,0.0000,0.9986,0.0523,0.6293,-0.0406,0.7761},
-{7349.2017,72.8832,-2315.8101,0.7771,0.0329,-0.6285,0.0000,0.9986,0.0523,0.6293,-0.0406,0.7761},
-{7359.3906,72.0356,-2328.3936,0.7771,0.0329,-0.6285,0.0000,0.9986,0.0523,0.6293,-0.0406,0.7761},
-{7369.5801,71.1872,-2340.9753,0.7771,0.0329,-0.6285,0.0000,0.9986,0.0523,0.6293,-0.0406,0.7761},
-{7379.7695,70.3394,-2353.5569,0.7771,0.0329,-0.6285,0.0000,0.9986,0.0523,0.6293,-0.0406,0.7761},
-{7388.3960,69.6223,-2364.2097,0.7771,0.0329,-0.6285,0.0000,0.9986,0.0523,0.6293,-0.0406,0.7761},
-{7398.5854,68.7736,-2376.7898,0.7771,0.0329,-0.6285,0.0000,0.9986,0.0523,0.6293,-0.0406,0.7761},
-{7409.5562,67.8609,-2390.3333,0.7771,0.0329,-0.6285,0.0000,0.9986,0.0523,0.6293,-0.0406,0.7761},
-{7418.9639,67.0783,-2401.9490,0.7771,0.0329,-0.6285,0.0000,0.9986,0.0523,0.6293,-0.0406,0.7761},
-{7429.1504,66.2302,-2414.5271,0.7771,0.0329,-0.6285,0.0000,0.9986,0.0523,0.6293,-0.0406,0.7761},
-{7439.3330,65.4734,-2427.1064,0.7771,0.0309,-0.6286,0.0000,0.9988,0.0492,0.6293,-0.0382,0.7762},
-{7449.5322,64.9018,-2439.7000,0.7771,0.0277,-0.6287,0.0000,0.9990,0.0440,0.6293,-0.0342,0.7764},
-{7459.7334,64.3361,-2452.2959,0.7771,0.0256,-0.6288,-0.0000,0.9992,0.0407,0.6293,-0.0317,0.7765},
-{7469.9326,63.9352,-2464.8906,0.7771,0.0212,-0.6290,0.0000,0.9994,0.0337,0.6293,-0.0262,0.7767},
-{7480.1357,63.6531,-2477.4949,0.7771,0.0175,-0.6291,0.0000,0.9996,0.0279,0.6293,-0.0217,0.7768},
-{7488.7803,63.4184,-2488.1729,0.7771,0.0141,-0.6292,0.0000,0.9998,0.0224,0.6293,-0.0174,0.7769},
-{7498.9819,63.3260,-2500.7727,0.7772,0.0099,-0.6292,0.0000,0.9999,0.0157,0.6293,-0.0122,0.7771},
-{7508.4165,63.3260,-2512.4224,0.7772,0.0063,-0.6293,0.0000,0.9999,0.0101,0.6293,-0.0078,0.7771},
-{7517.8423,63.3260,-2524.0605,0.7772,0.0040,-0.6293,0.0000,1.0000,0.0064,0.6293,-0.0050,0.7771},
-{7527.5151,63.3260,-2537.0818,0.7889,0.0026,-0.6145,-0.0001,1.0000,0.0041,0.6145,-0.0032,0.7889},
-{7536.2217,63.3260,-2549.2781,0.7962,0.0017,-0.6050,-0.0001,1.0000,0.0026,0.6050,-0.0020,0.7962},
-{7544.0410,63.3260,-2560.5464,0.8071,0.0011,-0.5904,-0.0001,1.0000,0.0017,0.5904,-0.0013,0.8071},
-{7552.3394,63.3260,-2573.0142,0.8188,0.0007,-0.5741,-0.0001,1.0000,0.0011,0.5741,-0.0008,0.8188},
-{7560.4170,63.3699,-2585.6399,0.8260,0.0004,-0.5636,-0.0001,1.0000,0.0007,0.5636,-0.0005,0.8260},
-{7567.9102,63.2820,-2598.6165,0.8364,0.0003,-0.5481,-0.0000,1.0000,0.0004,0.5481,-0.0003,0.8364},
-{7575.5000,63.3259,-2611.5159,0.8474,0.0002,-0.5310,-0.0000,1.0000,0.0003,0.5310,-0.0002,0.8474},
-{7582.9380,63.3259,-2624.5229,0.8542,0.0001,-0.5199,-0.0000,1.0000,0.0002,0.5199,-0.0001,0.8542},
-{7590.5186,63.3254,-2637.4324,0.8680,0.0001,-0.4965,-0.0000,1.0000,0.0001,0.4965,-0.0001,0.8680},
-{7596.6807,63.3254,-2649.6958,0.8766,0.0000,-0.4813,-0.0000,1.0000,0.0001,0.4813,-0.0001,0.8766},
-{7602.6733,63.2815,-2662.0557,0.8819,0.0000,-0.4715,-0.0000,1.0000,0.0000,0.4715,-0.0000,0.8819},
-{7609.6904,63.2815,-2675.2920,0.8852,0.0000,-0.4652,-0.0000,1.0000,0.0000,0.4652,-0.0000,0.8852},
-{7616.0518,63.2815,-2687.4590,0.8873,0.0000,-0.4612,-0.0000,1.0000,0.0000,0.4612,-0.0000,0.8873},
-{7622.9922,63.3693,-2702.1208,0.8886,0.0000,-0.4586,-0.0000,1.0000,0.0000,0.4586,-0.0000,0.8886},
-{7629.8555,63.3254,-2715.4343,0.8895,0.0000,-0.4569,-0.0000,1.0000,0.0000,0.4569,-0.0000,0.8895},
-{7636.1289,63.3254,-2727.6519,0.8900,0.0000,-0.4559,-0.0000,1.0000,0.0000,0.4559,-0.0000,0.8900},
-{7642.9614,63.2815,-2740.9807,0.8904,0.0000,-0.4552,-0.0000,1.0000,0.0000,0.4552,-0.0000,0.8904},
-{7649.7842,63.2815,-2754.3162,0.8906,0.0000,-0.4547,-0.0000,1.0000,0.0000,0.4547,-0.0000,0.8906},
-{7656.0298,63.2815,-2766.5483,0.8908,0.0000,-0.4545,-0.0000,1.0000,0.0000,0.4545,-0.0000,0.8908},
-{7662.8423,63.2815,-2779.8889,0.8909,0.0000,-0.4543,-0.0000,1.0000,0.0000,0.4543,-0.0000,0.8909},
-{7669.0864,63.2815,-2792.1218,0.8909,0.0000,-0.4542,-0.0000,1.0000,0.0000,0.4542,-0.0000,0.8909},
-{7676.4595,63.2815,-2806.5627,0.8909,0.0000,-0.4541,-0.0000,1.0000,0.0000,0.4541,-0.0000,0.8909},
-{7683.2676,63.2815,-2819.9028,0.8910,0.0000,-0.4541,-0.0000,1.0000,0.0000,0.4541,-0.0000,0.8910},
-{7690.6406,63.2815,-2834.3489,0.8910,0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7697.4463,63.2815,-2847.6870,0.8910,0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7704.2539,63.2815,-2861.0291,0.8910,0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7710.4956,63.2815,-2873.2637,0.8910,0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7717.8701,63.2815,-2887.7078,0.8910,0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7725.2437,63.2815,-2902.1489,0.8910,0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7732.0522,63.2815,-2915.4895,0.8910,0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7738.8623,63.2815,-2928.8323,0.8910,0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7745.6704,63.2815,-2942.1772,0.8910,0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7752.4795,63.2815,-2955.5212,0.8910,0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7759.2881,63.2815,-2968.8672,0.8910,0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7766.0947,63.2815,-2982.2104,0.8910,0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7772.3350,63.2815,-2994.4473,0.8910,0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7779.7051,63.2815,-3008.8938,0.8910,0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7785.9443,63.2815,-3021.1287,0.8910,0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7792.1836,63.2815,-3033.3645,0.8910,-0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7798.9922,63.2815,-3046.7104,0.8910,-0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7805.7983,63.2815,-3060.0566,0.8910,0.0000,-0.4540,0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7812.6045,63.2815,-3073.4041,0.8910,0.0000,-0.4540,0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7819.9727,63.2815,-3087.8540,0.8910,-0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7826.2109,63.2815,-3100.0891,0.8910,0.0000,-0.4540,0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7833.0176,63.2815,-3113.4314,0.8910,-0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7840.8794,63.2815,-3126.2358,0.8910,0.0000,-0.4540,0.0000,1.0000,-0.0000,0.4540,-0.0000,0.8910},
-{7845.8140,63.2815,-3139.1396,0.8910,-0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7852.6177,63.3255,-3152.4819,0.8910,0.0000,-0.4540,0.0000,1.0000,-0.0000,0.4540,0.0000,0.8910},
-{7858.8579,63.2815,-3164.7170,0.8910,-0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,0.0000,0.8910},
-{7865.6626,63.2815,-3178.0591,0.8910,-0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7871.9004,63.2815,-3190.2969,0.8910,-0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{7879.2666,63.2815,-3204.7476,0.8910,-0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,0.0000,0.8910},
-{7886.0723,63.2815,-3218.0894,0.8910,-0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,0.0000,0.8910},
-{7892.8755,63.2815,-3231.4297,0.8910,-0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,0.0000,0.8910},
-{7899.6812,63.2815,-3244.7742,0.8910,0.0000,-0.4540,0.0000,1.0000,-0.0000,0.4540,0.0000,0.8910},
-{7906.4868,63.2815,-3258.1218,0.8910,0.0000,-0.4540,0.0000,1.0000,-0.0000,0.4540,-0.0000,0.8910},
-{7913.2925,63.2815,-3271.4675,0.8910,0.0000,-0.4540,0.0000,1.0000,-0.0000,0.4540,-0.0000,0.8910},
-{7920.6597,63.2814,-3285.9177,0.8910,0.0000,-0.4540,0.0000,1.0000,0.0000,0.4540,0.0000,0.8910},
-{7928.6118,63.2809,-3297.2800,0.8910,0.0000,-0.4540,0.0000,1.0000,0.0000,0.4540,0.0000,0.8910},
-{7935.5059,63.2809,-3310.5813,0.8910,0.0000,-0.4540,0.0000,1.0000,-0.0000,0.4540,0.0000,0.8910},
-{7942.8755,63.2809,-3325.0305,0.8910,0.0000,-0.4540,0.0000,1.0000,0.0000,0.4540,0.0000,0.8910},
-{7949.6797,63.2809,-3338.3738,0.8910,0.0000,-0.4540,0.0000,1.0000,-0.0000,0.4540,-0.0000,0.8910},
-{7955.9199,63.2809,-3350.6116,0.8910,-0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,0.0000,0.8910},
-{7962.1611,63.2809,-3362.8499,0.8910,0.0000,-0.4540,0.0000,1.0000,0.0000,0.4540,0.0000,0.8910},
-{7968.3965,63.2809,-3375.0845,0.8910,0.0000,-0.4540,0.0000,1.0000,0.0000,0.4540,0.0000,0.8910},
-{7975.1982,63.2809,-3388.4307,0.8910,0.0000,-0.4540,0.0000,1.0000,-0.0000,0.4540,-0.0000,0.8910},
-{7981.4375,63.3250,-3400.6692,0.8910,0.0000,-0.4540,0.0000,1.0000,0.0000,0.4540,0.0000,0.8910},
-{7987.6768,63.3250,-3412.9082,0.8910,-0.0000,-0.4540,-0.0000,1.0000,-0.0000,0.4540,-0.0000,0.8910},
-{7994.4795,63.2809,-3426.2493,0.8910,0.0000,-0.4540,0.0000,1.0000,-0.0000,0.4540,-0.0000,0.8910},
-{8001.8423,63.2809,-3440.6970,0.8910,-0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,0.0000,0.8910},
-{8008.6436,63.2809,-3454.0449,0.8910,-0.0000,-0.4540,-0.0000,1.0000,-0.0000,0.4540,-0.0000,0.8910},
-{8014.8809,63.2809,-3466.2817,0.8910,0.0000,-0.4540,0.0000,1.0000,0.0000,0.4540,0.0000,0.8910},
-{8021.1206,63.2809,-3478.5190,0.8910,0.0000,-0.4540,0.0000,1.0000,-0.0000,0.4540,-0.0000,0.8910},
-{8028.4868,63.2809,-3492.9697,0.8910,0.0000,-0.4540,0.0000,1.0000,-0.0000,0.4540,0.0000,0.8910},
-{8034.7256,63.2809,-3505.2065,0.8910,-0.0000,-0.4540,-0.0000,1.0000,-0.0000,0.4540,-0.0000,0.8910},
-{8041.5293,63.2809,-3518.5483,0.8910,0.0000,-0.4540,0.0000,1.0000,-0.0000,0.4540,-0.0000,0.8910},
-{8047.7671,63.2809,-3530.7871,0.8910,0.0000,-0.4540,0.0000,1.0000,-0.0000,0.4540,0.0000,0.8910},
-{8054.5713,63.2809,-3544.1282,0.8910,0.0000,-0.4540,0.0000,1.0000,0.0000,0.4540,0.0000,0.8910},
-{8061.3770,63.2809,-3557.4775,0.8910,0.0000,-0.4540,0.0000,1.0000,-0.0000,0.4540,0.0000,0.8910},
-{8067.6152,63.2809,-3569.7134,0.8910,-0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{8073.8530,63.2809,-3581.9500,0.8910,0.0000,-0.4540,0.0000,1.0000,-0.0000,0.4540,-0.0000,0.8910},
-{8080.2339,63.3121,-3596.9094,0.8910,-0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{8087.2544,63.2809,-3608.7593,0.8910,-0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{8093.4946,63.2809,-3620.9929,0.8910,-0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{8100.2979,63.2809,-3634.3381,0.8910,-0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{8107.0981,63.2809,-3647.6843,0.8910,-0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{8113.8994,63.2809,-3661.0244,0.8910,0.0000,-0.4540,-0.0000,1.0000,0.0000,0.4540,-0.0000,0.8910},
-{8120.9346,63.2805,-3674.2451,0.8878,-0.0000,-0.4602,-0.0000,1.0000,0.0000,0.4602,-0.0000,0.8878},
-{8128.5483,63.2805,-3685.7278,0.8831,0.0000,-0.4691,0.0000,1.0000,0.0000,0.4691,0.0000,0.8831},
-{8137.2671,63.2805,-3698.0227,0.8801,0.0000,-0.4748,0.0000,1.0000,0.0000,0.4748,0.0000,0.8801},
-{8145.0059,63.2805,-3712.2773,0.8781,0.0000,-0.4784,0.0000,1.0000,-0.0000,0.4784,-0.0000,0.8781},
-{8152.1934,63.2805,-3725.4124,0.8769,-0.0000,-0.4807,0.0000,1.0000,0.0000,0.4807,0.0000,0.8769},
-{8159.4077,63.2805,-3738.5422,0.8761,0.0000,-0.4822,-0.0000,1.0000,-0.0000,0.4822,-0.0000,0.8761},
-{8166.0415,63.2805,-3750.5708,0.8755,0.0000,-0.4831,0.0000,1.0000,0.0000,0.4831,0.0000,0.8755},
-{8173.2871,63.2805,-3763.6816,0.8752,0.0000,-0.4838,0.0000,1.0000,-0.0000,0.4838,-0.0000,0.8752},
-{8179.9365,63.2805,-3775.7017,0.8750,-0.0000,-0.4841,-0.0000,1.0000,0.0000,0.4841,-0.0000,0.8750},
-{8187.2510,63.2805,-3787.3511,0.8749,-0.0000,-0.4844,-0.0000,1.0000,0.0000,0.4844,-0.0000,0.8749},
-{8194.5137,63.2805,-3800.4536,0.8748,0.0000,-0.4845,0.0000,1.0000,-0.0000,0.4845,0.0000,0.8748},
-{8201.1738,63.2805,-3812.4641,0.8747,0.0000,-0.4846,-0.0000,1.0000,-0.0000,0.4846,-0.0000,0.8747},
-{8208.4395,63.2805,-3825.5627,0.8747,0.0000,-0.4847,0.0000,1.0000,-0.0000,0.4847,-0.0000,0.8747},
-{8215.7080,63.3319,-3838.6653,0.8747,0.0000,-0.4848,0.0000,1.0000,0.0000,0.4848,0.0000,0.8747},
-{8222.9727,63.3319,-3851.7625,0.8746,-0.0000,-0.4848,-0.0000,1.0000,0.0000,0.4848,0.0000,0.8746},
-{8230.2393,63.2804,-3864.8625,0.8746,0.0000,-0.4848,-0.0000,1.0000,0.0000,0.4848,-0.0000,0.8746},
-{8239.2910,63.3317,-3878.4167,0.8467,0.0000,-0.5321,0.0000,1.0000,0.0000,0.5321,0.0000,0.8467},
-{8247.5654,63.3831,-3890.9905,0.8379,-0.0000,-0.5458,-0.0000,1.0000,0.0000,0.5458,-0.0000,0.8379},
-{8257.0137,63.2803,-3902.7266,0.8322,-0.0000,-0.5545,-0.0000,1.0000,0.0000,0.5545,-0.0000,0.8322},
-{8265.6230,63.2803,-3915.0110,0.8284,0.0000,-0.5601,0.0000,1.0000,0.0000,0.5601,0.0000,0.8284},
-{8274.2627,63.2803,-3927.2729,0.8260,-0.0000,-0.5636,-0.0000,1.0000,-0.0000,0.5636,-0.0000,0.8260},
-{8281.8330,63.2803,-3938.7307,0.8240,0.0000,-0.5666,0.0000,1.0000,-0.0000,0.5666,-0.0000,0.8240},
-{8290.3965,63.3682,-3951.0271,0.8223,-0.0000,-0.5691,-0.0000,1.0000,0.0000,0.5691,0.0000,0.8223},
-{8298.7480,63.3681,-3963.4622,0.8212,0.0000,-0.5707,-0.0000,1.0000,0.0000,0.5707,-0.0000,0.8212},
-{8305.5010,63.2803,-3977.0190,0.8205,0.0000,-0.5717,-0.0000,1.0000,-0.0000,0.5717,-0.0000,0.8205},
-{8314.0664,63.2803,-3989.3008,0.8200,0.0000,-0.5724,-0.0000,1.0000,0.0000,0.5724,-0.0000,0.8200},
-{8321.9307,63.2803,-4000.5625,0.8197,0.0000,-0.5728,-0.0000,1.0000,-0.0000,0.5728,-0.0000,0.8197},
-{8331.2188,63.3242,-4013.8552,0.8195,0.0000,-0.5730,0.0000,1.0000,0.0000,0.5730,0.0000,0.8195},
-{8339.0938,63.3681,-4025.1172,0.8194,0.0000,-0.5732,0.0000,1.0000,0.0000,0.5732,0.0000,0.8194},
-{8348.3887,63.3681,-4038.4050,0.8193,0.0000,-0.5733,0.0000,1.0000,0.0000,0.5733,0.0000,0.8193},
-{8356.9746,63.2803,-4050.6738,0.8193,-0.0000,-0.5734,-0.0000,1.0000,0.0000,0.5734,-0.0000,0.8193},
-{8364.8467,63.2803,-4061.9258,0.8192,-0.0000,-0.5734,-0.0000,1.0000,-0.0000,0.5734,-0.0000,0.8192},
-{8373.4268,63.2803,-4074.1963,0.8192,0.0000,-0.5735,0.0000,1.0000,0.0000,0.5735,0.0000,0.8192},
-{8380.9170,63.2803,-4088.7473,0.8192,0.0000,-0.5735,-0.0000,1.0000,0.0000,0.5735,-0.0000,0.8192},
-{8389.5039,63.2803,-4101.0103,0.8192,-0.0000,-0.5735,0.0000,1.0000,0.0000,0.5735,0.0000,0.8192},
-{8398.8047,63.2803,-4114.2935,0.8192,-0.0000,-0.5735,-0.0000,1.0000,0.0000,0.5735,-0.0000,0.8192},
-{8408.1143,63.3681,-4127.5845,0.8192,0.0000,-0.5735,0.0000,1.0000,-0.0000,0.5735,0.0000,0.8192},
-{8415.9951,63.3681,-4138.8389,0.8192,0.0000,-0.5735,0.0000,1.0000,0.0000,0.5735,0.0000,0.8192},
-{8423.8750,63.3241,-4150.0903,0.8192,0.0000,-0.5735,-0.0000,1.0000,-0.0000,0.5735,-0.0000,0.8192},
-{8433.0742,63.2801,-4163.4424,0.8263,-0.0000,-0.5632,-0.0000,1.0000,0.0000,0.5632,-0.0000,0.8263},
-{8441.4521,63.2801,-4175.8564,0.8308,-0.0000,-0.5565,-0.0000,1.0000,0.0000,0.5565,-0.0000,0.8308},
-{8449.0586,63.2801,-4187.2896,0.8337,-0.0000,-0.5522,-0.0000,1.0000,0.0000,0.5522,0.0000,0.8337},
-{8459.1465,63.2801,-4198.5796,0.8355,-0.0000,-0.5495,-0.0000,1.0000,0.0000,0.5495,-0.0000,0.8355},
-{8467.3662,63.2801,-4211.0972,0.8367,-0.0000,-0.5477,-0.0000,1.0000,-0.0000,0.5477,-0.0000,0.8367},
-{8474.8838,63.2801,-4222.5923,0.8374,0.0000,-0.5466,0.0000,1.0000,-0.0000,0.5466,0.0000,0.8374},
-{8483.0693,63.2801,-4235.1318,0.8379,0.0000,-0.5459,0.0000,1.0000,0.0000,0.5459,0.0000,0.8379},
-{8490.5381,63.2801,-4246.6592,0.8420,-0.0000,-0.5396,0.0000,1.0000,0.0000,0.5396,0.0000,0.8420},
-{8497.8760,63.2801,-4258.2729,0.8475,0.0000,-0.5308,-0.0000,1.0000,-0.0000,0.5308,-0.0000,0.8475},
-{8505.1250,63.3240,-4269.9429,0.8510,0.0000,-0.5251,0.0000,1.0000,-0.0000,0.5251,0.0000,0.8510},
-{8512.9639,63.3679,-4282.7075,0.8532,0.0000,-0.5215,0.0000,1.0000,-0.0000,0.5215,-0.0000,0.8532},
-{8520.7598,63.3679,-4295.4995,0.8547,-0.0000,-0.5192,-0.0000,1.0000,-0.0000,0.5192,-0.0000,0.8547},
-{8527.8818,63.3679,-4307.2441,0.8556,0.0000,-0.5177,0.0000,1.0000,-0.0000,0.5177,-0.0000,0.8556},
-{8536.2773,63.3679,-4321.1221,0.8561,0.0000,-0.5167,-0.0000,1.0000,-0.0000,0.5167,-0.0000,0.8561},
-{8543.5723,63.3239,-4334.2148,0.8565,-0.0000,-0.5161,-0.0000,1.0000,0.0000,0.5161,-0.0000,0.8565},
-{8551.2002,63.3678,-4347.1025,0.8632,-0.0000,-0.5049,-0.0000,1.0000,0.0000,0.5049,-0.0000,0.8632},
-{8557.6104,63.3239,-4359.2539,0.8673,-0.0000,-0.4977,-0.0000,1.0000,0.0000,0.4977,-0.0000,0.8673},
-{8565.0312,63.3678,-4372.2705,0.8700,-0.0000,-0.4931,-0.0000,1.0000,-0.0000,0.4931,-0.0000,0.8700},
-{8571.3271,63.3678,-4384.4839,0.8717,-0.0000,-0.4901,-0.0000,1.0000,0.0000,0.4901,-0.0000,0.8717},
-{8578.0449,63.3239,-4396.4595,0.8727,0.0000,-0.4882,-0.0000,1.0000,0.0000,0.4882,-0.0000,0.8727},
-{8585.3496,63.3239,-4409.5352,0.8734,0.0000,-0.4870,-0.0000,1.0000,-0.0000,0.4870,-0.0000,0.8734},
-{8592.0371,63.3678,-4421.5371,0.8738,-0.0000,-0.4862,-0.0000,1.0000,0.0000,0.4862,-0.0000,0.8738},
-{8599.2881,63.3677,-4434.6445,0.8775,-0.0000,-0.4796,-0.0000,1.0000,0.0000,0.4796,0.0000,0.8775},
-{8605.9268,63.3237,-4448.0669,0.8824,0.0000,-0.4704,-0.0000,1.0000,-0.0000,0.4704,-0.0000,0.8824},
-{8612.9238,63.3676,-4461.3145,0.8856,-0.0000,-0.4645,-0.0000,1.0000,0.0000,0.4645,-0.0000,0.8856},
-{8618.8086,63.3237,-4473.7285,0.8875,0.0000,-0.4607,0.0000,1.0000,0.0000,0.4607,0.0000,0.8875},
-{8625.6885,63.3677,-4487.0303,0.8888,0.0000,-0.4583,-0.0000,1.0000,0.0000,0.4583,-0.0000,0.8888},
-{8632.5430,63.3676,-4500.3530,0.8896,-0.0000,-0.4567,-0.0000,1.0000,0.0000,0.4567,-0.0000,0.8896},
-{8639.9434,63.3676,-4514.7837,0.8901,0.0000,-0.4557,0.0000,1.0000,0.0000,0.4557,0.0000,0.8901},
-{8646.7686,63.2908,-4528.1196,0.8904,0.0008,-0.4551,0.0000,1.0000,0.0017,0.4551,-0.0016,0.8904},
-{8653.5820,63.0497,-4541.4585,0.8907,0.0033,-0.4547,0.0000,1.0000,0.0074,0.4547,-0.0066,0.8906},
-{8660.3887,62.7884,-4554.7974,0.8908,0.0050,-0.4544,0.0000,0.9999,0.0110,0.4544,-0.0098,0.8907},
-{8666.6250,62.5488,-4567.0303,0.8909,0.0060,-0.4542,0.0000,0.9999,0.0133,0.4542,-0.0119,0.8908},
-{8672.8643,62.3093,-4579.2632,0.8909,0.0067,-0.4541,0.0000,0.9999,0.0148,0.4541,-0.0132,0.8908},
-{8679.1025,62.0698,-4591.4976,0.8910,0.0071,-0.4540,0.0000,0.9999,0.0158,0.4541,-0.0141,0.8909},
-{8685.3379,61.8302,-4603.7329,0.8910,0.0074,-0.4540,0.0000,0.9999,0.0164,0.4540,-0.0146,0.8909},
-{8692.1396,61.5690,-4617.0767,0.8910,0.0076,-0.4539,0.0000,0.9999,0.0167,0.4540,-0.0149,0.8909},
-{8698.9424,61.2435,-4630.4175,0.8910,0.0085,-0.4539,0.0000,0.9998,0.0187,0.4540,-0.0167,0.8909},
-{8705.1826,60.7966,-4642.6562,0.8910,0.0111,-0.4538,0.0000,0.9997,0.0246,0.4540,-0.0219,0.8907},
-{8711.9854,60.2732,-4655.9995,0.8910,0.0128,-0.4538,-0.0000,0.9996,0.0283,0.4540,-0.0252,0.8907},
-{8718.7842,59.7501,-4669.3394,0.8910,0.0139,-0.4538,-0.0000,0.9995,0.0307,0.4540,-0.0273,0.8906},
-{8725.0205,59.2706,-4681.5718,0.8910,0.0146,-0.4537,-0.0000,0.9995,0.0322,0.4540,-0.0287,0.8905},
-{8731.2549,58.7911,-4693.8037,0.8910,0.0151,-0.4537,-0.0000,0.9994,0.0332,0.4540,-0.0295,0.8905},
-{8738.0557,58.2682,-4707.1411,0.8910,0.0154,-0.4537,-0.0000,0.9994,0.0338,0.4540,-0.0301,0.8905},
-{8744.2920,57.7886,-4719.3706,0.8910,0.0155,-0.4537,-0.0000,0.9994,0.0342,0.4540,-0.0305,0.8905},
-{8750.5293,57.2247,-4731.6016,0.8910,0.0171,-0.4537,-0.0000,0.9993,0.0376,0.4540,-0.0335,0.8904},
-{8757.3320,56.4524,-4744.9414,0.8910,0.0195,-0.4536,-0.0000,0.9991,0.0429,0.4540,-0.0382,0.8902},
-{8763.5625,55.7329,-4757.1724,0.8910,0.0210,-0.4535,-0.0000,0.9989,0.0463,0.4540,-0.0412,0.8901},
-{8770.3574,54.9481,-4770.5122,0.8910,0.0220,-0.4534,0.0000,0.9988,0.0485,0.4540,-0.0432,0.8900},
-{8777.1514,54.1636,-4783.8501,0.8910,0.0226,-0.4534,0.0000,0.9988,0.0499,0.4540,-0.0444,0.8899},
-{8783.9434,53.3794,-4797.1860,0.8910,0.0230,-0.4534,0.0000,0.9987,0.0507,0.4540,-0.0452,0.8899},
-{8790.7383,52.5949,-4810.5220,0.8910,0.0233,-0.4534,0.0000,0.9987,0.0513,0.4540,-0.0457,0.8898},
-{8797.5322,51.7910,-4823.8545,0.8910,0.0242,-0.4533,0.0000,0.9986,0.0534,0.4540,-0.0476,0.8897},
-{8803.7627,50.9091,-4836.0786,0.8910,0.0263,-0.4532,0.0000,0.9983,0.0579,0.4540,-0.0516,0.8895},
-{8809.9893,49.9501,-4848.2959,0.8910,0.0282,-0.4531,0.0000,0.9981,0.0622,0.4539,-0.0554,0.8893},
-{8816.2139,48.9911,-4860.5137,0.8910,0.0294,-0.4530,0.0000,0.9979,0.0649,0.4539,-0.0578,0.8892},
-{8823.0010,47.9451,-4873.8379,0.8910,0.0302,-0.4529,0.0000,0.9978,0.0666,0.4539,-0.0594,0.8890},
-{8829.7861,46.8996,-4887.1606,0.8910,0.0307,-0.4529,0.0001,0.9977,0.0678,0.4539,-0.0604,0.8890},
-{8836.5723,45.8541,-4900.4844,0.8910,0.0310,-0.4529,0.0001,0.9977,0.0685,0.4539,-0.0610,0.8889},
-{8843.3584,44.8087,-4913.8066,0.8910,0.0312,-0.4529,0.0001,0.9976,0.0689,0.4539,-0.0614,0.8889},
-{8849.5791,43.8505,-4926.0176,0.8910,0.0314,-0.4529,0.0001,0.9976,0.0692,0.4539,-0.0617,0.8889},
-{8855.7998,42.8923,-4938.2310,0.8910,0.0315,-0.4528,0.0001,0.9976,0.0694,0.4539,-0.0619,0.8889},
-{8862.0225,41.9341,-4950.4419,0.8910,0.0315,-0.4528,0.0001,0.9976,0.0695,0.4539,-0.0620,0.8889},
-{8868.8096,40.8886,-4963.7612,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0696,0.4539,-0.0621,0.8889},
-{8875.0303,39.9308,-4975.9731,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0621,0.8889},
-{8881.8193,38.8853,-4989.2896,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0621,0.8889},
-{8888.6074,37.8402,-5002.6069,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0621,0.8889},
-{8895.3945,36.7951,-5015.9243,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{8901.6172,35.8370,-5028.1348,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{8908.4043,34.7918,-5041.4512,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{8914.6270,33.8337,-5053.6602,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{8920.8486,32.8757,-5065.8696,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{8927.6328,31.8307,-5079.1860,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{8933.8535,30.8727,-5091.3940,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{8940.0742,29.9145,-5103.6055,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{8946.2949,28.9564,-5115.8145,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{8953.0791,27.9116,-5129.1304,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{8959.2998,26.9538,-5141.3394,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{8966.0830,25.9087,-5154.6543,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{8972.8672,24.8639,-5167.9678,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{8979.6523,23.8191,-5181.2827,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{8985.8721,22.8616,-5193.4902,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{8992.6572,21.8164,-5206.8018,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{8999.4414,20.7716,-5220.1157,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{9005.6621,19.8141,-5232.3232,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{9013.0107,18.6823,-5246.7417,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{9019.2314,17.7244,-5258.9478,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{9025.4502,16.7669,-5271.1543,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{9031.6719,15.8091,-5283.3604,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{9038.4541,14.7639,-5296.6729,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{9045.2373,13.7190,-5309.9844,0.8910,0.0316,-0.4528,0.0001,0.9976,0.0697,0.4539,-0.0622,0.8889},
-{9043.1855,12.8430,-5323.9912,0.9856,0.0316,0.1661,-0.0414,0.9976,0.0561,-0.1639,-0.0622,0.9845},
-{9045.6533,11.9695,-5337.3901,0.9979,0.0316,-0.0569,-0.0280,0.9976,0.0639,0.0588,-0.0622,0.9963},
-{9051.6328,10.9975,-5350.2202,0.9787,0.0316,-0.2027,-0.0183,0.9976,0.0673,0.2044,-0.0622,0.9769},
-{9058.8525,10.0677,-5361.5845,0.9550,0.0316,-0.2950,-0.0118,0.9976,0.0687,0.2965,-0.0622,0.9530},
-{9066.4854,9.1212,-5372.9380,0.9351,0.0316,-0.3530,-0.0076,0.9976,0.0693,0.3543,-0.0622,0.9331},
-{9074.5840,8.2296,-5385.5181,0.9205,0.0288,-0.3896,-0.0044,0.9980,0.0633,0.3907,-0.0566,0.9188},
-{9082.5625,7.6632,-5398.2114,0.9104,0.0241,-0.4130,-0.0024,0.9986,0.0531,0.4137,-0.0474,0.9092},
-{9089.8096,7.2223,-5409.9194,0.9036,0.0212,-0.4278,-0.0013,0.9989,0.0466,0.4283,-0.0415,0.9027},
-{9097.3633,6.6618,-5422.8760,0.8992,0.0193,-0.4371,-0.0008,0.9991,0.0424,0.4376,-0.0378,0.8984},
-{9103.9629,6.1392,-5436.3125,0.8963,0.0180,-0.4431,-0.0005,0.9992,0.0397,0.4435,-0.0354,0.8956},
-{9111.1016,5.8063,-5449.4780,0.8944,0.0144,-0.4470,-0.0003,0.9995,0.0317,0.4473,-0.0282,0.8940},
-{9117.2637,5.8014,-5461.7490,0.8932,0.0092,-0.4496,-0.0001,0.9998,0.0203,0.4497,-0.0181,0.8930},
-{9124.0205,5.8014,-5475.1284,0.8924,0.0059,-0.4512,-0.0000,0.9999,0.0130,0.4512,-0.0116,0.8923},
-{9130.2305,5.8014,-5487.3862,0.8919,0.0038,-0.4522,-0.0000,1.0000,0.0083,0.4522,-0.0074,0.8919},
-{9136.4561,5.8014,-5499.6431,0.8916,0.0024,-0.4528,-0.0000,1.0000,0.0053,0.4528,-0.0047,0.8916},
-{9143.8096,6.0247,-5514.1079,0.8914,-0.0029,-0.4532,0.0000,1.0000,-0.0064,0.4533,0.0057,0.8914},
-{9150.0322,6.5036,-5526.3394,0.8912,-0.0076,-0.4535,0.0000,0.9999,-0.0166,0.4535,0.0148,0.8911},
-{9156.8359,7.0263,-5539.7031,0.8912,-0.0106,-0.4536,0.0000,0.9997,-0.0232,0.4537,0.0207,0.8909},
-{9163.0723,7.5060,-5551.9517,0.8911,-0.0125,-0.4536,0.0000,0.9996,-0.0274,0.4538,0.0244,0.8908},
-{9169.8760,8.0297,-5565.3096,0.8911,-0.0137,-0.4537,0.0000,0.9995,-0.0301,0.4539,0.0268,0.8907},
-{9176.1064,8.7560,-5577.5415,0.8911,-0.0189,-0.4535,0.0000,0.9991,-0.0416,0.4539,0.0370,0.8903},
-{9182.9238,9.8005,-5590.8501,0.8910,-0.0235,-0.4533,0.0000,0.9987,-0.0517,0.4539,0.0461,0.8899},
-{9189.7412,10.9214,-5604.1699,0.8910,-0.0264,-0.4532,0.0000,0.9983,-0.0582,0.4539,0.0518,0.8895},
-{9195.9912,11.8806,-5616.3843,0.8910,-0.0283,-0.4530,0.0000,0.9981,-0.0623,0.4539,0.0555,0.8893},
-{9202.8066,12.9251,-5629.7021,0.8910,-0.0295,-0.4530,0.0000,0.9979,-0.0650,0.4539,0.0579,0.8892},
-{9209.0479,13.8830,-5641.9077,0.8910,-0.0303,-0.4529,0.0000,0.9978,-0.0667,0.4539,0.0594,0.8891},
-{9216.4170,15.0145,-5656.3228,0.8910,-0.0308,-0.4529,0.0000,0.9977,-0.0678,0.4539,0.0604,0.8890},
-{9223.2109,16.0580,-5669.6240,0.8910,-0.0311,-0.4529,0.0000,0.9977,-0.0685,0.4539,0.0610,0.8889},
-{9229.4404,17.0151,-5681.8247,0.8910,-0.0313,-0.4529,0.0000,0.9976,-0.0689,0.4539,0.0614,0.8889},
-{9236.2246,18.0587,-5695.1279,0.8910,-0.0314,-0.4529,0.0000,0.9976,-0.0692,0.4539,0.0616,0.8889},
-{9243.0078,19.1021,-5708.4321,0.8910,-0.0315,-0.4528,0.0000,0.9976,-0.0694,0.4539,0.0618,0.8889},
-{9249.2236,20.0591,-5720.6367,0.8910,-0.0316,-0.4528,0.0000,0.9976,-0.0695,0.4539,0.0619,0.8889},
-{9255.9990,21.0646,-5733.9473,0.8910,-0.0316,-0.4528,0.0000,0.9976,-0.0696,0.4539,0.0620,0.8889},
-{9262.7754,22.1460,-5747.2568,0.8910,-0.0316,-0.4528,0.0000,0.9976,-0.0696,0.4539,0.0620,0.8889},
-{9269.5518,23.1894,-5760.5605,0.8910,-0.0316,-0.4528,0.0000,0.9976,-0.0696,0.4539,0.0621,0.8889},
-{9276.8984,24.3197,-5774.9751,0.8910,-0.0316,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9283.1221,25.2772,-5787.1816,0.8910,-0.0316,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9289.9043,26.3208,-5800.4873,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9296.1279,27.2778,-5812.6870,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9302.9121,28.2831,-5825.9863,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9309.1357,29.2398,-5838.1890,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9315.9160,30.2832,-5851.4907,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9322.6982,31.3266,-5864.7944,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9329.4814,32.3697,-5878.0928,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9336.2656,33.4129,-5891.3931,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9342.4883,34.3701,-5903.5957,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9349.2676,35.4129,-5916.8926,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9356.0527,36.4563,-5930.1963,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9362.8350,37.4995,-5943.4980,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9369.6201,38.5430,-5956.8013,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9376.4014,39.5862,-5970.1040,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9383.1846,40.6298,-5983.4062,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9389.4023,41.5483,-5995.6074,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9396.1855,42.5921,-6008.9146,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9402.9707,43.6351,-6022.2158,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9409.7520,44.6784,-6035.5171,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9416.5342,45.7217,-6048.8179,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9423.3154,46.7649,-6062.1187,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9430.0986,47.8081,-6075.4199,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9436.8779,48.8513,-6088.7212,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9443.6602,49.8946,-6102.0220,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9450.4443,50.9379,-6115.3232,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9457.2285,51.9812,-6128.6245,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9464.0117,53.0243,-6141.9253,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9470.7930,54.0675,-6155.2275,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9478.1387,55.1964,-6169.6284,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9484.3594,56.1538,-6181.8306,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9493.9326,57.6271,-6200.6162,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9501.8223,58.8421,-6216.1055,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9509.1592,59.9713,-6230.5034,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9515.3760,60.9277,-6242.7026,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9521.5938,61.8843,-6254.9019,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9528.3760,62.9280,-6268.2070,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9535.1592,63.9711,-6281.5068,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9541.9424,65.0145,-6294.8091,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9548.1650,65.9711,-6307.0083,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9554.9512,67.0147,-6320.3101,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9563.4141,68.3156,-6336.9019,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9571.8760,69.6173,-6353.4927,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9579.7734,70.8325,-6368.9829,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9588.2314,72.1331,-6385.5723,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9595.0088,73.1763,-6398.8662,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9601.2266,74.1328,-6411.0654,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9608.0117,75.1763,-6424.3682,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9614.2324,76.1331,-6436.5674,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9621.0117,77.1764,-6449.8730,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9627.2324,78.1337,-6462.0791,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9634.5742,79.2625,-6476.4805,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9640.7920,80.2200,-6488.6821,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9647.0156,81.1771,-6500.8843,0.8910,-0.0317,-0.4528,0.0000,0.9976,-0.0697,0.4539,0.0621,0.8889},
-{9653.8008,82.1955,-6514.1943,0.8910,-0.0309,-0.4529,0.0000,0.9977,-0.0680,0.4539,0.0606,0.8890},
-{9661.7090,83.1804,-6529.7012,0.8910,-0.0283,-0.4531,0.0000,0.9981,-0.0623,0.4539,0.0555,0.8893},
-{9669.0361,84.0262,-6544.0859,0.8910,-0.0267,-0.4532,-0.0000,0.9983,-0.0587,0.4540,0.0523,0.8895},
-{9675.8154,84.8093,-6557.3965,0.8910,-0.0256,-0.4532,-0.0000,0.9984,-0.0564,0.4540,0.0503,0.8896},
-{9682.5967,85.5922,-6570.7085,0.8910,-0.0249,-0.4533,-0.0000,0.9985,-0.0550,0.4540,0.0490,0.8897},
-{9689.3828,86.3752,-6584.0186,0.8910,-0.0245,-0.4533,-0.0000,0.9985,-0.0540,0.4540,0.0481,0.8897},
-{9696.1709,87.0998,-6597.3423,0.8910,-0.0234,-0.4534,-0.0000,0.9987,-0.0517,0.4540,0.0460,0.8898},
-{9702.9678,87.6606,-6610.6685,0.8910,-0.0207,-0.4535,0.0000,0.9990,-0.0456,0.4540,0.0407,0.8901},
-{9709.7578,88.1833,-6623.9907,0.8910,-0.0190,-0.4536,0.0000,0.9991,-0.0418,0.4540,0.0372,0.8902},
-{9715.9893,88.6625,-6636.2139,0.8910,-0.0179,-0.4536,0.0000,0.9992,-0.0393,0.4540,0.0350,0.8903},
-{9723.3408,89.2279,-6650.6377,0.8910,-0.0171,-0.4537,0.0000,0.9993,-0.0377,0.4540,0.0336,0.8904},
-{9730.1299,89.7504,-6663.9634,0.8910,-0.0167,-0.4537,0.0000,0.9993,-0.0367,0.4540,0.0327,0.8904},
-{9737.4883,90.2596,-6678.3984,0.8910,-0.0156,-0.4537,0.0000,0.9994,-0.0343,0.4540,0.0306,0.8905},
-{9743.7207,90.5399,-6690.6294,0.8910,-0.0128,-0.4538,-0.0000,0.9996,-0.0282,0.4540,0.0252,0.8907},
-{9750.5186,90.8011,-6703.9663,0.8910,-0.0110,-0.4538,-0.0000,0.9997,-0.0244,0.4539,0.0217,0.8908},
-{9757.3154,91.0623,-6717.3003,0.8910,-0.0099,-0.4538,-0.0000,0.9998,-0.0219,0.4539,0.0195,0.8908},
-{9764.1133,91.3234,-6730.6392,0.8910,-0.0092,-0.4538,-0.0000,0.9998,-0.0203,0.4539,0.0181,0.8908},
-{9770.9082,91.5845,-6743.9756,0.8910,-0.0087,-0.4539,-0.0000,0.9998,-0.0193,0.4539,0.0172,0.8909},
-{9777.1445,91.8018,-6756.2163,0.8910,-0.0076,-0.4539,-0.0000,0.9999,-0.0169,0.4539,0.0150,0.8909},
-{9783.9512,91.8765,-6769.5576,0.8910,-0.0055,-0.4539,-0.0000,0.9999,-0.0122,0.4539,0.0109,0.8910},
-{9790.7520,91.8765,-6782.8965,0.8910,-0.0035,-0.4539,-0.0000,1.0000,-0.0078,0.4540,0.0070,0.8910},
-{9797.5488,91.8765,-6796.2334,0.8910,-0.0023,-0.4540,-0.0000,1.0000,-0.0050,0.4540,0.0045,0.8910},
-{9804.9102,91.8765,-6810.6743,0.8910,-0.0014,-0.4540,-0.0000,1.0000,-0.0032,0.4540,0.0028,0.8910},
-{9811.7090,91.8765,-6824.0132,0.8910,-0.0009,-0.4540,-0.0000,1.0000,-0.0020,0.4540,0.0018,0.8910},
-{9819.0713,91.9204,-6838.4575,0.8910,-0.0006,-0.4540,-0.0000,1.0000,-0.0013,0.4540,0.0012,0.8910},
-{9825.4531,91.9204,-6850.6235,0.8823,-0.0004,-0.4707,-0.0000,1.0000,-0.0008,0.4707,0.0007,0.8823},
-{9833.6650,91.9643,-6864.6021,0.8766,-0.0002,-0.4813,-0.0000,1.0000,-0.0005,0.4813,0.0005,0.8766},
-{9842.5898,91.9203,-6879.6128,0.8728,-0.0002,-0.4880,-0.0000,1.0000,-0.0003,0.4880,0.0003,0.8728},
-{9851.1514,91.9643,-6894.8320,0.8704,-0.0001,-0.4923,-0.0000,1.0000,-0.0002,0.4923,0.0002,0.8704},
-{9859.6104,91.9643,-6908.6763,0.8688,-0.0001,-0.4951,-0.0000,1.0000,-0.0001,0.4951,0.0001,0.8688},
-{9868.1377,91.9203,-6922.4468,0.8626,-0.0000,-0.5059,-0.0000,1.0000,-0.0001,0.5059,0.0001,0.8626},
-{9876.2764,91.9203,-6935.0015,0.8542,-0.0000,-0.5199,-0.0000,1.0000,-0.0001,0.5199,0.0001,0.8542}
-}
-
-do
-    local cframes = {}
-    for _, row in ipairs(_HARDCODED_PATH_DATA) do
-        table.insert(cframes, CFrame.new(
-            row[1],row[2],row[3],
-            row[4],row[5],row[6],
-            row[7],row[8],row[9],
-            row[10],row[11],row[12]
-        ))
-    end
-    RecordedPath = cframes
-
-end
-
-local PathReplay = {
-    Index = 1,
-    Progress = 0,
-}
-
-local function startPathReplay(model)
-    if not RecordedPath or #RecordedPath < 2 then return false end
-    PathReplay.Index = 1
-    PathReplay.Progress = 0
-    pcall(function() model:PivotTo(RecordedPath[1]) end)
-    local wp = getWeightPart(model)
-    if wp then
-        pcall(function()
-            wp.AssemblyLinearVelocity = Vector3.zero
-            wp.AssemblyAngularVelocity = Vector3.zero
-        end)
-    end
-    return true
-end
-
-task.spawn(function()
-    while true do
-        RunService.Heartbeat:Wait()
-        if not CarFarm.Enabled or CarFarm.Mode ~= "Replay" then continue end
-        if not RecordedPath or #RecordedPath < 2 then continue end
-        local model = getDrivenVehicleModel()
-        if not model then continue end
-        local N = #RecordedPath
-        local function snapToStart()
-            PathReplay.Index = 1
-            PathReplay.Progress = 0
-            pcall(function() model:PivotTo(RecordedPath[1]) end)
-            local wp = getWeightPart(model)
-            if wp then pcall(function()
-                wp.AssemblyLinearVelocity = Vector3.zero
-                wp.AssemblyAngularVelocity = Vector3.zero
-            end) end
-        end
-        if PathReplay.Index >= N then snapToStart() continue end
-        local i = PathReplay.Index
-        local cur, nxt = RecordedPath[i], RecordedPath[i + 1]
-        local segDist = (nxt.Position - cur.Position).Magnitude
-        if segDist < 0.001 then PathReplay.Index = i + 1; PathReplay.Progress = 0; continue end
-        local speed = CarFarm.Speed or 5
-        PathReplay.Progress = PathReplay.Progress + speed / segDist
-        local wrapped = false
-        while PathReplay.Progress >= 1 do
-            PathReplay.Progress = PathReplay.Progress - 1
-            PathReplay.Index = PathReplay.Index + 1
-            if PathReplay.Index >= N then
-                snapToStart()
-                wrapped = true
-                break
-            end
-            cur, nxt = RecordedPath[PathReplay.Index], RecordedPath[PathReplay.Index + 1]
-            segDist = (nxt.Position - cur.Position).Magnitude
-        end
-        if not wrapped then
-            local target = cur:Lerp(nxt, PathReplay.Progress)
-            pcall(function() model:PivotTo(target) end)
-            local wp = getWeightPart(model)
-            if wp then
-                local d = nxt.Position - cur.Position
-                if d.Magnitude > 0.001 then
-                    local u, sps = d.Unit, speed * 60
-                    pcall(function()
-                        wp.AssemblyLinearVelocity = Vector3.new(u.X * sps, 0, u.Z * sps)
-                        wp.AssemblyAngularVelocity = Vector3.zero
-                    end)
-                end
-            end
-        end
-    end
-end)
-
-GuiLibrary:CreateSection(tabCar, "Car Auto Farm")
-GuiLibrary:CreateLabel(tabCar, "Sit in your best car, then toggle. Drives a fixed loop.")
-
-CarFarm.Mode                    = "Basic"
-CarFarm.BasicDistance           = 12000
-CarFarm.Speed                   = 5
-CarFarm.LookAhead               = 200
-CarFarm.SmoothFactor            = 0.2
-CarFarm.ExploreChance           = 0.1
-CarFarm.SnapToRoad              = true
-CarFarm.GroundOffset            = 0
-CarFarm.UseAdvancedLanePlanning = true
-CarFarm.UseArrowBias            = false
-
-GuiLibrary:CreateToggle(tabCar, "Car Auto Farm", false, function(s)
-
+--------------------------------------------------------------------
+-- Car tab
+--------------------------------------------------------------------
+GuiLibrary:CreateSection(tabCar, "Auto Drive")
+GuiLibrary:CreateLabel(tabCar, "Reads the map's own roads each session. No fixed route.")
+GuiLibrary:CreateToggle(tabCar, "Auto Drive", false, function(s)
     if s then
-        CarFarm.Enabled = false
-        task.wait(0.1)
-        if not RecordedPath or #RecordedPath < 2 then
-            notify("Car Farm", "Hardcoded path missing.", 5, "error")
-            return
-        end
-        local m = getDrivenVehicleModel()
-        if not m then
-            notify("Car Farm", "Spawning best car...", 3, "info")
-            local ok = pcall(ensureBestCarSpawnedAndEntered)
-            if not ok then
-                notify("Car Farm", "Auto-spawn failed.", 4, "error")
-                return
+        AutoDrive.Enabled = false
+        task.spawn(function()
+            if autoDriveStart() then
+                AutoDrive.Enabled = true
+                notify("Auto Drive", ("Rolling -- %d road nodes"):format(#RoadNav.Nodes), 3, "success")
+            else
+                AutoDrive.Enabled = false
             end
-            task.wait(0.8)
-            m = getDrivenVehicleModel()
-        end
-        if not m then
-            notify("Car Farm", "Still not in a car. Sit in one manually.", 5, "warning")
-            return
-        end
-        if startPathReplay(m) then
-            CarFarm.Mode = "Replay"
-            CarFarm.Enabled = true
-            notify("Car Farm", ("Replay started (%d waypoints)"):format(#RecordedPath), 3, "success")
-        else
-            notify("Car Farm", "Failed to start replay", 3, "error")
-        end
+        end)
     else
-        CarFarm.Enabled = false
-        CarFarm.Mode = nil
-        notify("Car", "Stopped.", 2, "info")
+        AutoDrive.Enabled = false
+        AutoDrive.Status = "idle"
+        notify("Auto Drive", "Stopped.", 2, "info")
     end
 end)
-
+GuiLibrary:CreateButton(tabCar, "Rebuild Road Graph", function()
+    task.spawn(function()
+        RoadNav.Build()
+        notify("Auto Drive", ("%d road nodes from %d folders"):format(#RoadNav.Nodes, RoadNav.Sources),
+            4, RoadNav.Built and "success" or "warning")
+        local model = getDrivenVehicleModel()
+        if model and AutoDrive.Enabled then
+            local p = model:GetPivot()
+            Router.Reset(p.Position, AutoDrive.Dir)
+            resetPath(p.Position)
+        end
+    end)
+end)
+local function ownedCarOptions()
+    local ids = listOwnedVehicleIds()
+    if #ids == 0 then return { "(none detected)" } end
+    table.insert(ids, 1, "(auto)")
+    return ids
+end
+local carDropdown = GuiLibrary:CreateDropdown(tabCar, "Vehicle to spawn", ownedCarOptions(), function(v)
+    if v == "(auto)" or v == "(none detected)" then
+        MANUAL_BEST_CAR = ""
+        notify("Car", "Using auto-detect.", 2, "info")
+    else
+        MANUAL_BEST_CAR = v
+        notify("Car", "Will spawn: " .. v, 2, "success")
+    end
+end)
+GuiLibrary:CreateButton(tabCar, "Refresh Vehicle List", function()
+    local opts = ownedCarOptions()
+    if carDropdown and carDropdown.UpdateOptions then carDropdown.UpdateOptions(opts, true) end
+    print("[DE] owned vehicle ids:", table.concat(opts, ", "))
+    notify("Car", ("%d vehicles found (see console)"):format(math.max(0, #opts - 1)), 4, "info")
+end)
+GuiLibrary:CreateButton(tabCar, "Spawn + Sit In Best Car", function()
+    task.spawn(function()
+        if ensureCarSpawnedAndEntered() then
+            notify("Car", "In the car.", 2, "success")
+        else
+            notify("Car", "Could not spawn -- pick one in the dropdown.", 5, "error")
+        end
+    end)
+end)
 local lblCar = GuiLibrary:CreateLabel(tabCar, "Idle")
 
 GuiLibrary:CreateSection(tabCar, "Car Mods")
@@ -2748,16 +3001,16 @@ GuiLibrary:CreateToggle(tabCar, "Rainbow Car (server)", false, function(s)
     Rainbow.Enabled = s
     notify("Car", s and "Rainbow ON" or "OFF", 2, s and "success" or "info")
 end)
-GuiLibrary:CreateSlider(tabCar, "Rainbow Speed", 0.1, 3, 0.5, function(v)
-    Rainbow.Speed = v
-end)
-GuiLibrary:CreateSlider(tabCar, "Rainbow Interval (s)", 0.2, 2, 0.4, function(v)
-    Rainbow.Interval = v
-end)
+GuiLibrary:CreateSlider(tabCar, "Rainbow Speed", 0.1, 3, 0.5, function(v) Rainbow.Speed = v end)
+GuiLibrary:CreateSlider(tabCar, "Rainbow Interval (s)", 0.2, 2, 0.4, function(v) Rainbow.Interval = v end)
 GuiLibrary:CreateButton(tabCar, "Despawn Vehicle", function()
+    AutoDrive.Enabled = false
     pcall(function() ReplicatedStorage.Remotes.VehicleEvent:FireServer("Despawn") end)
 end)
 
+--------------------------------------------------------------------
+-- Police / Delivery
+--------------------------------------------------------------------
 GuiLibrary:CreateSection(tabPolice, "Security Job")
 GuiLibrary:CreateButton(tabPolice, "Join Security Job", function()
     joinSecurityJob()
@@ -2773,6 +3026,27 @@ GuiLibrary:CreateToggle(tabPolice, "Auto Arrest Criminals", false, function(s)
     if s then Police.ArrStats = 0 end
     notify("Police", s and "Auto-arrest ON" or "OFF", 2, s and "success" or "info")
 end)
+GuiLibrary:CreateToggle(tabPolice, "Teleport to criminal", true, function(s)
+    Police.ArrestTeleport = s
+    notify("Police", s and "Will TP to targets (car comes too)" or "Drive there yourself", 3, "info")
+end)
+GuiLibrary:CreateButton(tabPolice, "Teleport To Nearest Wanted", function()
+    task.spawn(function()
+        local targets = getWantedCriminals()
+        local crim = targets[1]
+        if not crim then
+            notify("Police", "Nobody in this server is wanted.", 3, "warning")
+            return
+        end
+        local ch = crim.Character and crim.Character:FindFirstChild("HumanoidRootPart")
+        if not ch then
+            notify("Police", crim.Name .. " is not loaded in.", 3, "warning")
+            return
+        end
+        moveSelfTo(ch.CFrame * CFrame.new(0, 0, arrestStandoff(crim)))
+        notify("Police", "-> " .. crim.Name, 2, "info")
+    end)
+end)
 GuiLibrary:CreateSection(tabPolice, "Status")
 local lblPolice = GuiLibrary:CreateLabel(tabPolice, "Idle")
 
@@ -2786,7 +3060,7 @@ GuiLibrary:CreateToggle(tabDelivery, "Full Auto Delivery (Car)", false, function
     AutoDelivery.Enabled = s
     notify("Delivery", s and "Full auto ON" or "OFF", 2, s and "success" or "info")
 end)
-GuiLibrary:CreateInput(tabDelivery, "Teleport delay (s) — higher = safer", function(text)
+GuiLibrary:CreateInput(tabDelivery, "Teleport delay (s) -- higher = safer", function(text)
     local v = tonumber(text)
     if v and v >= 0.1 and v <= 30 then
         AutoDelivery.Delay = v
@@ -2798,6 +3072,9 @@ end)
 GuiLibrary:CreateSection(tabDelivery, "Status")
 local lblDelivery = GuiLibrary:CreateLabel(tabDelivery, "Idle")
 
+--------------------------------------------------------------------
+-- ESP
+--------------------------------------------------------------------
 GuiLibrary:CreateSection(tabESP, "Player ESP")
 GuiLibrary:CreateToggle(tabESP, "Enable ESP", false, function(s) ESP.Enabled = s end)
 GuiLibrary:CreateToggle(tabESP, "Box", true, function(s) ESP.Box = s end)
@@ -2808,41 +3085,62 @@ GuiLibrary:CreateToggle(tabESP, "Tracers", false, function(s) ESP.Tracer = s end
 GuiLibrary:CreateToggle(tabESP, "Team Check (hide allies)", false, function(s) ESP.TeamCheck = s end)
 GuiLibrary:CreateSlider(tabESP, "Max Distance", 100, 5000, 2000, function(v) ESP.MaxDist = v end)
 
+--------------------------------------------------------------------
+-- Teleports
+--------------------------------------------------------------------
 local TELE_LOCATIONS = {
     { "Spawn",            Vector3.new(-300, 16, -1698) },
     { "ATM Area",         Vector3.new(-2060, 16, 3415) },
     { "Criminal Dropoff", Vector3.new(-2543, 16, 4030) },
     { "Crime Scene Area", Vector3.new(1479, 11, 608) },
-    { "Car Farm Spot",    Vector3.new(8119, 67, -4583) },
     { "Dealership",       Vector3.new(-422, 18, -1772) },
     { "Water ATM Area",   Vector3.new(-1055, 14, 5048) },
     { "City Center",      Vector3.new(-1893, 16, 2198) },
 }
 GuiLibrary:CreateSection(tabTele, "Teleport (car if seated, else you)")
-GuiLibrary:CreateLabel(tabTele, "In a car? It teleports the car with you.")
+
+-- Teleporting mid-drive would be undone on the next frame, so re-anchor the
+-- router at the new spot instead of fighting it.
+local function teleportAndReanchor(pos, label)
+    teleportEntity(pos, 5)
+    if AutoDrive.Enabled then
+        Router.Reset(pos, AutoDrive.Dir)
+        resetPath(pos)
+    end
+    if label then notify("Teleport", "-> " .. label, 2, "info") end
+end
+
+GuiLibrary:CreateButton(tabTele, "Nearest Road (live)", function()
+    task.spawn(function()
+        if not RoadNav.Built then RoadNav.Build() end
+        local hrp = getHRP()
+        if not hrp then return end
+        local i = RoadNav.Nearest(hrp.Position)
+        if not i then notify("Teleport", "No road found.", 3, "warning") return end
+        teleportAndReanchor(RoadNav.Nodes[i].p, "nearest road")
+    end)
+end)
 for _, e in ipairs(TELE_LOCATIONS) do
     local nm, pos = e[1], e[2]
     GuiLibrary:CreateButton(tabTele, nm, function()
-        teleportEntity(pos, 5)
-        notify("Teleport", "→ " .. nm, 2, "info")
+        teleportAndReanchor(pos, nm)
     end)
 end
 GuiLibrary:CreateSection(tabTele, "Players")
 local teleTargetName = nil
-local teleDropdown = GuiLibrary:CreateDropdown(tabTele, "Target Player", (function()
+local function playerNameList()
     local names = {}
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= LocalPlayer then table.insert(names, p.Name) end
     end
     if #names == 0 then names = { "(none)" } end
     return names
-end)(), function(v) teleTargetName = v end)
+end
+local teleDropdown = GuiLibrary:CreateDropdown(tabTele, "Target Player", playerNameList(), function(v)
+    teleTargetName = v
+end)
 GuiLibrary:CreateButton(tabTele, "Refresh Players", function()
-    local names = {}
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= LocalPlayer then table.insert(names, p.Name) end
-    end
-    if #names == 0 then names = { "(none)" } end
+    local names = playerNameList()
     if teleDropdown and teleDropdown.UpdateOptions then teleDropdown.UpdateOptions(names, true) end
 end)
 GuiLibrary:CreateButton(tabTele, "Teleport To Player", function()
@@ -2850,13 +3148,15 @@ GuiLibrary:CreateButton(tabTele, "Teleport To Player", function()
     local tchar = target and target.Character
     local thrp = tchar and tchar:FindFirstChild("HumanoidRootPart")
     if thrp then
-        teleportEntity(thrp.Position + Vector3.new(0, 0, 6), 5)
-        notify("Teleport", "→ " .. teleTargetName, 2, "info")
+        teleportAndReanchor(thrp.Position + Vector3.new(0, 0, 6), teleTargetName)
     else
         notify("Teleport", "Player not found.", 3, "warning")
     end
 end)
 
+--------------------------------------------------------------------
+-- Misc
+--------------------------------------------------------------------
 GuiLibrary:CreateSection(tabMisc, "Auto Claim")
 GuiLibrary:CreateToggle(tabMisc, "Auto Claim Rewards (playtime+pending)", false, function(s)
     PlaytimeRewards.Enabled = s
@@ -2871,7 +3171,6 @@ GuiLibrary:CreateToggle(tabMisc, "Auto Collect Cash Drops", false, function(s)
     CashCollect.Enabled = s
     notify("Misc", s and "Cash drop collect ON" or "OFF", 2, s and "success" or "info")
 end)
-
 GuiLibrary:CreateToggle(tabMisc, "Fast Loading (skip load screens)", false, function(s)
     FastLoad.Enabled = s
     if s then pcall(killLoadingScreens) end
@@ -2882,11 +3181,10 @@ GuiLibrary:CreateSection(tabMisc, "Vehicle Fly")
 GuiLibrary:CreateLabel(tabMisc, "In a car: WASD move, Space up, Shift down.")
 GuiLibrary:CreateToggle(tabMisc, "Vehicle Fly", false, function(s)
     VehFly.Enabled = s
+    if s then AutoDrive.Enabled = false end
     notify("Misc", s and "Vehicle fly ON" or "OFF", 2, s and "success" or "info")
 end)
-GuiLibrary:CreateSlider(tabMisc, "Fly Speed", 20, 400, 80, function(v)
-    VehFly.Speed = v
-end)
+GuiLibrary:CreateSlider(tabMisc, "Fly Speed", 20, 400, 80, function(v) VehFly.Speed = v end)
 
 GuiLibrary:CreateSection(tabMisc, "Player")
 GuiLibrary:CreateToggle(tabMisc, "Walk Speed", false, function(s)
@@ -2899,19 +3197,22 @@ end)
 
 GuiLibrary:CreateSection(tabMisc, "Debug")
 GuiLibrary:CreateButton(tabMisc, "Print Status", function()
-
+    print("[DE] road nodes:", #RoadNav.Nodes, "from", RoadNav.Sources, "folders")
+    print("[DE] autodrive:", AutoDrive.Status, "node", Router.Node, "dist", math.floor(AutoDrive.Distance))
     if _heistDataCache then
         for id, data in pairs(_heistDataCache) do
             local active, secLeft = computeHeistState(id, data)
-
+            print("[DE] heist", id, active and "OPEN" or "closed", math.floor(secLeft or 0) .. "s")
         end
     end
-
     notify("Debug", "Printed to console.", 2, "info")
 end)
 
+--=====================================================================
+--  Status readout
+--=====================================================================
 task.spawn(function()
-    while true do
+    while alive() do
         task.wait(0.5)
 
         lblCrim1.SetText(("Phase: %s  |  Job: %s"):format(
@@ -2928,17 +3229,21 @@ task.spawn(function()
             getStars(), countMoneyBags(), tostring(math.floor(getCurrentBagValue())),
             #listAvailableATMs(), heistTxt, AutoFarm.Stats.ATMs, AutoFarm.Stats.Deposits))
 
-        if CarFarm.Enabled and CarFarm.Mode == "Replay" then
-            lblCar.SetText(("Driving — waypoint %d / %d"):format(
-                PathReplay.Index or 0, RecordedPath and #RecordedPath or 0))
+        if AutoDrive.Enabled then
+            lblCar.SetText(("%s | on this road %d studs | %.1fk driven"):format(
+                AutoDrive.Status, math.floor(Router.RunStuds or 0), AutoDrive.Distance / 1000))
+        elseif RoadNav.Built then
+            lblCar.SetText(("Idle | %d road nodes ready"):format(#RoadNav.Nodes))
         else
-            lblCar.SetText("Idle")
+            lblCar.SetText("Idle | road graph not built yet")
         end
 
         local jid = LocalPlayer:GetAttribute("JobId") or "-"
 
-        lblPolice.SetText(("Job %s | CrimeScenes %d | Arrests %d | Wanted nearby %d"):format(
-            jid, Police.CSStats, Police.ArrStats, #getWantedCriminals()))
+        lblPolice.SetText(("Job %s | Scenes %d (%s) | Arrests %d | Wanted %d | %s"):format(
+            jid, Police.CSStats, Police.CrimeScene and Police.CSStatus or "off",
+            Police.ArrStats, #getWantedCriminals(),
+            Police.Arrest and Police.ArrStatus or "off"))
 
         local dst = getDeliveryState()
         local dtxt
@@ -2951,6 +3256,74 @@ task.spawn(function()
         lblDelivery.SetText(("Job %s | %s | Auto %s"):format(
             jid, dtxt, AutoDelivery.Enabled and "ON" or "off"))
     end
+end)
+
+-- Build the road graph in the background so the first toggle is instant.
+task.spawn(function()
+    task.wait(4)
+    local ok = RoadNav.Build()
+    if ok then
+        print(("[DE] road graph: %d nodes from %d folders"):format(#RoadNav.Nodes, RoadNav.Sources))
+    else
+        warn(("[DE] road graph looks thin (%d nodes) -- hit Rebuild Road Graph once the map streams in"):format(#RoadNav.Nodes))
+    end
+end)
+
+-- Everything this run owns, so the next run can remove it. Drawing objects are
+-- the dangerous ones: they are not parented to anything, so without this they
+-- survive forever and stack up on screen with every reload.
+pcall(function()
+    if not getgenv then return end
+    local myGen = GEN
+    local myWindow = window
+    getgenv().__DE_CLEANUP = function()
+        for _, c in ipairs(_conns) do pcall(function() c:Disconnect() end) end
+        table.clear(_conns)
+        AutoDrive.Enabled = false
+        AutoFarm.Enabled = false
+        Police.CrimeScene, Police.Arrest = false, false
+        AutoDelivery.Enabled = false
+        ESP.Enabled = false
+        for plr in pairs(espObjects) do removeESP(plr) end
+        pcall(function()
+            local mf = myWindow and myWindow.MainFrame
+            local sg = mf and mf.Parent
+            if sg and sg:IsA("ScreenGui") then sg:Destroy() elseif mf then mf:Destroy() end
+        end)
+        if getgenv().__DE_GEN == myGen then getgenv().DE = nil end
+    end
+end)
+
+-- The GUI library fires slider callbacks while it builds them, which overwrites
+-- these with whatever position it starts the handle at. Re-assert them once the
+-- window is finished; dragging a slider still wins after this.
+AutoDrive.Speed = 430
+AutoDrive.Hover = math.clamp(AutoDrive.Hover, 0, AutoDrive.HoverMax)
+Router.SameRoadCone = math.cos(math.rad(37))
+Router.TurnCone     = math.cos(math.rad(120))
+
+-- Handle for debugging and for driving the script from the console:
+--   getgenv().DE.StartDrive()   getgenv().DE.StopDrive()
+--   getgenv().DE.AutoDrive.Speed = 400
+pcall(function()
+    if not getgenv then return end
+    getgenv().DE = {
+        RoadNav    = RoadNav,
+        Router     = Router,
+        AutoDrive  = AutoDrive,
+        AutoFarm   = AutoFarm,
+        Police     = Police,
+        StartDrive = function()
+            AutoDrive.Enabled = false
+            if autoDriveStart() then AutoDrive.Enabled = true end
+            return AutoDrive.Enabled, AutoDrive.Status
+        end,
+        StopDrive  = function()
+            AutoDrive.Enabled = false
+            AutoDrive.Status = "idle"
+        end,
+        Vehicle    = getDrivenVehicleModel,
+    }
 end)
 
 notify("Driving Empire", "Loaded", 4, "success")
