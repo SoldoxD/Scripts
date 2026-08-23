@@ -33,7 +33,9 @@ local _conns = {}
 local function track(conn) table.insert(_conns, conn) return conn end
 
 local function _elevate()
-    local s = (setthreadidentity or (syn and syn.set_thread_identity) or setidentity)
+    local env = getgenv and getgenv()
+    local synApi = env and rawget(env, "syn")
+    local s = setthreadidentity or (synApi and synApi.set_thread_identity) or setidentity
     if s then pcall(s, 8) end
 end
 
@@ -1623,15 +1625,20 @@ local function huntPositions()
     if _huntCache and _huntCacheGen == RoadNav.Generation then return _huntCache end
     if not RoadNav.Built or #RoadNav.Nodes < 50 then return HUNT_POSITIONS end
 
-    local CELL = 2500
-    local seen, out = {}, {}
+    -- Streaming does not reach across the old 2,500-stud cells. Keep the
+    -- samples close enough together that an ATM near a road actually loads.
+    local CELL = 650
+    local cells, out = {}, {}
     for _, n in ipairs(RoadNav.Nodes) do
-        local key = math.floor(n.p.X / CELL) .. "," .. math.floor(n.p.Z / CELL)
-        if not seen[key] then
-            seen[key] = true
-            table.insert(out, n.p)
+        local gx, gz = math.floor(n.p.X / CELL), math.floor(n.p.Z / CELL)
+        local key = gx .. "," .. gz
+        local centre = Vector3.new((gx + 0.5) * CELL, n.p.Y, (gz + 0.5) * CELL)
+        local score = (n.p - centre).Magnitude
+        if not cells[key] or score < cells[key].score then
+            cells[key] = { p = n.p, score = score }
         end
     end
+    for _, sample in pairs(cells) do table.insert(out, sample.p) end
     if #out < 4 then return HUNT_POSITIONS end
 
     -- shuffle so two sessions do not sweep in the same order
@@ -1667,11 +1674,31 @@ local function getAtmModel(adornee)
     end
     return adornee.Parent
 end
+
+-- A rejected ATM can remain tagged and look available for several seconds.
+-- Without a local cooldown getNearestATM selects it again every loop forever.
+local ATMRetry = {
+    after = setmetatable({}, { __mode = "k" }),
+    failures = setmetatable({}, { __mode = "k" }),
+}
+function ATMRetry.cool(model, succeeded)
+    if not model then return end
+    if succeeded then
+        ATMRetry.failures[model] = 0
+        ATMRetry.after[model] = tick() + 20
+        return
+    end
+    local failures = (ATMRetry.failures[model] or 0) + 1
+    ATMRetry.failures[model] = failures
+    ATMRetry.after[model] = tick() + math.min(60, 5 * (2 ^ math.min(failures - 1, 4)))
+end
 local function listAvailableATMs()
     local out = {}
     for _, comp in ipairs(CollectionService:GetTagged("CriminalATMClient")) do
         local model = getAtmModel(comp)
-        if model and model:GetAttribute("State") ~= "Busted" then
+        if model and model.Parent
+           and (ATMRetry.after[model] or 0) <= tick()
+           and model:GetAttribute("State") ~= "Busted" then
             local engaging = model:GetAttribute("EngagingPlayerId")
             if engaging == nil or engaging == LocalPlayer.UserId then
                 table.insert(out, { adornee = comp, model = model })
@@ -1810,7 +1837,7 @@ local function fireAllPromptsUnder(inst)
     if not fireproximityprompt then return end
     for _, d in ipairs(inst:GetDescendants()) do
         if d:IsA("ProximityPrompt") and d.Enabled then
-            pcall(fireproximityprompt, d, 0)
+            pcall(fireproximityprompt, d)
         end
     end
 end
@@ -1873,6 +1900,8 @@ local AutoFarm = {
     Stats = { ATMs = 0, Heists = 0, Failed = 0, Deposits = 0 },
     HoldGrace = 0.4,
     DepositThreshold = 0,
+    NextDepositAt = 0,
+    LastError = nil,
 }
 
 local function atmPivotPos(model, adornee)
@@ -1906,6 +1935,7 @@ local function bustOneATM(entry)
         return Remotes.invokeServer(CriminalConstants.RemoteFunctions.AttemptATMBustStart, atm)
     end)
     if not ok or not accepted then
+        ATMRetry.cool(atm, false)
         return false, ("BustStart failed: %s"):format(tostring(reason or accepted))
     end
 
@@ -1923,8 +1953,10 @@ local function bustOneATM(entry)
         return Remotes.invokeServer(CriminalConstants.RemoteFunctions.AttemptATMBustComplete, atm)
     end)
     if not ok2 or not completed then
+        ATMRetry.cool(atm, false)
         return false, ("BustComplete failed: %s"):format(tostring(reason2 or completed))
     end
+    ATMRetry.cool(atm, true)
     return true
 end
 
@@ -2051,10 +2083,16 @@ local function depositAndEvade(reason)
     notify("Farm", reason or "Depositing...", 2, "info")
     local ok, err = tryDepositAtDropoff()
     if ok then
+        AutoFarm.NextDepositAt = 0
+        AutoFarm.LastError = nil
         AutoFarm.Stats.Deposits = AutoFarm.Stats.Deposits + 1
         AutoFarm.Phase = "evadingStars"
         tpHighAndWaitForStars(90)
     else
+        -- A missing/streaming dropoff used to cause a teleport retry every
+        -- 0.4 seconds. Back off and keep the player in a stable state.
+        AutoFarm.NextDepositAt = tick() + 10
+        AutoFarm.LastError = "deposit: " .. tostring(err)
         warn("[DE] deposit failed:", err)
     end
 end
@@ -2098,13 +2136,35 @@ task.spawn(function()
             continue
         end
 
+        -- Deposit is the terminal action for a full criminal run. Do this
+        -- before choosing another visible ATM, otherwise a full player can get
+        -- stuck retrying ATMs that the server will never accept.
+        local canDeposit, depositReason = checkDropoffRequirements()
+        if canDeposit then
+            if tick() >= (AutoFarm.NextDepositAt or 0) then
+                depositAndEvade("Ready to cash out -- depositing")
+            else
+                AutoFarm.Phase = "depositCooldown"
+                task.wait(1)
+            end
+            continue
+        elseif playerHasAnyBag() and getStars() >= 5 then
+            -- Usually this is the short arrest debounce. Do not attempt more
+            -- ATMs while cash-out is otherwise ready.
+            AutoFarm.Phase = "waitingDropoff: " .. tostring(depositReason)
+            task.wait(1)
+            continue
+        end
+
         local entry = getNearestATM()
         if entry then
             AutoFarm.Phase = "bustingATM"
             local ok, err = bustOneATM(entry)
             if ok then
+                AutoFarm.LastError = nil
                 AutoFarm.Stats.ATMs = AutoFarm.Stats.ATMs + 1
             else
+                AutoFarm.LastError = tostring(err)
                 AutoFarm.Stats.Failed = AutoFarm.Stats.Failed + 1
                 if err and err:find("Debounce") then
                     waitForBustDebounceClear(6)
@@ -2138,7 +2198,9 @@ task.spawn(function()
         requestStreamAround(hp)
         local hh = getHRP()
         if hh then hh.CFrame = CFrame.new(hp + Vector3.new(0, 5, 0)) end
-        for _ = 1, 30 do
+        -- RequestStreaming normally resolves quickly; long waits made the farm
+        -- look frozen at every empty sample.
+        for _ = 1, 6 do
             if not AutoFarm.Enabled then break end
             task.wait(1)
             if getNearestATM() then break end
@@ -2873,6 +2935,8 @@ GuiLibrary:CreateSection(tabCrim, "ATM / Heist Farm")
 GuiLibrary:CreateToggle(tabCrim, "Criminal Auto Farm", false, function(s)
     AutoFarm.Enabled = s
     AutoFarm.Stats = { ATMs = 0, Heists = 0, Failed = 0, Deposits = 0 }
+    AutoFarm.NextDepositAt = 0
+    AutoFarm.LastError = nil
     notify("Farm", s and "Started" or "Stopped", 2, s and "success" or "info")
 end)
 GuiLibrary:CreateToggle(tabCrim, "TP up on arrest (off in heist)", false, function(s)
@@ -2906,6 +2970,7 @@ end)
 GuiLibrary:CreateSection(tabCrim, "Status")
 local lblCrim1 = GuiLibrary:CreateLabel(tabCrim, "Idle")
 local lblCrim2 = GuiLibrary:CreateLabel(tabCrim, "-")
+AutoFarm.ErrorLabel = GuiLibrary:CreateLabel(tabCrim, "No farm errors")
 
 --------------------------------------------------------------------
 -- Car tab
@@ -3121,9 +3186,8 @@ GuiLibrary:CreateButton(tabTele, "Nearest Road (live)", function()
     end)
 end)
 for _, e in ipairs(TELE_LOCATIONS) do
-    local nm, pos = e[1], e[2]
-    GuiLibrary:CreateButton(tabTele, nm, function()
-        teleportAndReanchor(pos, nm)
+    GuiLibrary:CreateButton(tabTele, e[1], function()
+        teleportAndReanchor(e[2], e[1])
     end)
 end
 GuiLibrary:CreateSection(tabTele, "Players")
@@ -3228,6 +3292,9 @@ task.spawn(function()
         lblCrim2.SetText(("Stars %d | Bags %d ($%s) | ATMs %d | Heist %s | Busted %d | Dep %d"):format(
             getStars(), countMoneyBags(), tostring(math.floor(getCurrentBagValue())),
             #listAvailableATMs(), heistTxt, AutoFarm.Stats.ATMs, AutoFarm.Stats.Deposits))
+        AutoFarm.ErrorLabel.SetText(AutoFarm.LastError
+            and ("Last error: " .. AutoFarm.LastError)
+            or ("Failed ATM attempts: " .. tostring(AutoFarm.Stats.Failed)))
 
         if AutoDrive.Enabled then
             lblCar.SetText(("%s | on this road %d studs | %.1fk driven"):format(
