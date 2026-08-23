@@ -67,9 +67,13 @@ local Remotes = {
 
 local machinesFolder = workspace:WaitForChild("machinesFolder")
 local treadmillsFolder = workspace:WaitForChild("Treadmills")
+local areaTeleportParts = workspace:WaitForChild("areaTeleportParts")
+local kingsGymPart = areaTeleportParts:WaitForChild("beachToMuscleKing")
 local crystalPrices = sharedFolder.catalogs.crystalPrices
 local gameUltimates = sharedFolder.catalogs.gameUltimatesFolder
 local fortuneWheel = sharedFolder.catalogs.fortuneWheelChances["Fortune Wheel"]
+local questCatalog = sharedFolder.catalogs:WaitForChild("Quests")
+local questsNpcs = workspace:WaitForChild("questsNpcs")
 
 local CHEST_NAMES = {"Golden Chest", "Enchanted Chest", "Magma Chest", "Mythical Chest", "Legends Chest", "Jungle Chest"}
 
@@ -123,10 +127,11 @@ local State = {
     Running = true,
     FarmMode = "Off",
     RepDelay = 0.06,
-    AutoBenchmark = true,
+    AutoBenchmark = false,
     BenchmarkSeconds = 12,
     BenchmarkEvery = 600,
     SourcePreference = "Auto (fastest)",
+    StrengthSource = "Auto (Fastest)",
     RotateSeconds = 120,
     AutoRebirth = false,
     AutoBoosts = false,
@@ -150,6 +155,7 @@ local State = {
     AutoDeletePets = false,
     DeletePetNames = {},
     AutoEvolvePets = false,
+    AlwaysKingsGym = false,
     AntiAFK = true,
     Notify = true,
 }
@@ -167,6 +173,7 @@ local Runtime = {
     Evolved = 0,
     RebirthCount = 0,
     RebirthBusy = false,
+    KingLockedUntil = 0,
     Heartbeat = 0,
     Rates = {},
     RatesStamp = 0,
@@ -232,9 +239,9 @@ if LocalPlayer.Character then bindCharacter(LocalPlayer.Character) end
 
 LocalPlayer.CharacterAdded:Connect(function(c)
     bindCharacter(c)
-    task.wait(2)
     Runtime.Blacklist = {}
-    if State.FarmMode ~= "Off" and restartFarm then restartFarm() end
+    Runtime.Heartbeat = os.clock()
+    if State.FarmMode ~= "Off" and not Runtime.RebirthBusy and restartFarm then restartFarm() end
 end)
 
 local function alive()
@@ -362,7 +369,9 @@ local function machineSources(gainKey)
         local gain = m:FindFirstChild(gainKey)
         local seat = m.PrimaryPart
         local repTime = m:FindFirstChild("repTime")
-        if gain and seat and seat:IsA("Seat") and not blacklisted(m) and meetsRequirements(m) then
+        local kingLocked = m:GetAttribute("IsKingMachine") == true
+            and (Runtime.KingLockedUntil or 0) > os.clock()
+        if gain and seat and seat:IsA("Seat") and not kingLocked and not blacklisted(m) and meetsRequirements(m) then
             local rt = repTime and repTime.Value or 1
             if rt <= 0 then rt = 1 end
             table.insert(list, {
@@ -406,10 +415,13 @@ local function candidateSources(gainKey)
         tools = toolSources(gainKey)
     end
     local out = {}
-    if State.SourcePreference ~= "Tools only" then
+    local preference = gainKey == "strengthGain" and State.StrengthSource or State.SourcePreference
+    local toolsOnly = preference == "Tools only" or preference == "Tools (Hotbar)"
+    local machinesOnly = preference == "Machines only" or preference == "Machines"
+    if not toolsOnly then
         for i = 1, math.min(2, #machines) do table.insert(out, machines[i]) end
     end
-    if State.SourcePreference ~= "Machines only" then
+    if not machinesOnly then
         for i = 1, math.min(2, #tools) do table.insert(out, tools[i]) end
     end
     if #out == 0 then
@@ -421,24 +433,32 @@ end
 
 local function engageMachine(source)
     if not alive() then return false end
-    if not leaveMachine() then
+    if isMounted() and not leaveMachine() then
         Runtime.Status = "Stuck on a machine, retrying"
-        task.wait(0.5)
+        task.wait(0.1)
         return false
     end
-    for _ = 1, 12 do
+    for _ = 1, 3 do
         if not alive() then return false end
         beat()
         anchorAt(source.seat.CFrame * CFrame.new(0, 5, 0))
-        task.wait(0.08)
+        task.wait(0.05)
     end
-    local res = invoke(Remotes.Machine, "useMachine", source.seat)
-    task.wait(0.4)
+    local res, reason = invoke(Remotes.Machine, "useMachine", source.seat)
     if res ~= true then
-        Runtime.Blacklist[source.model] = os.clock() + 180
+        if reason == "isKingMachine" or source.model:GetAttribute("IsKingMachine") == true then
+            Runtime.KingLockedUntil = os.clock() + 120
+        else
+            Runtime.Blacklist[source.model] = os.clock() + 180
+        end
         return false
     end
-    return true
+    local deadline = os.clock() + 0.6
+    while machineInUse.Value ~= source.seat and os.clock() < deadline do
+        beat()
+        task.wait(0.03)
+    end
+    return machineInUse.Value == source.seat
 end
 
 local function engageTool(source)
@@ -523,7 +543,9 @@ end
 local function pickSource(gainKey, token)
     local list = candidateSources(gainKey)
     if #list == 0 then return nil end
-    if State.AutoBenchmark then
+    -- Strength sources all use the same player multipliers, so gain / repTime
+    -- ranks them exactly without a long benchmark after every rebirth.
+    if State.AutoBenchmark and gainKey ~= "strengthGain" then
         local full = os.clock() - Runtime.RatesStamp > State.BenchmarkEvery
         if full then Runtime.Rates = {} end
         runBenchmark(gainKey, token, list, not full)
@@ -668,16 +690,19 @@ local function doRebirth()
     if State.AutoBoosts and State.SaveBigBoosts and Strength.Value < rebirthTarget() then
         useBoosts(true)
     end
-    leaveMachine()
-    task.wait(0.3)
+    if isMounted() then leaveMachine() end
+    local beforeStrength = Strength.Value
     local res = invoke(Remotes.Rebirth, "rebirthRequest")
     if res == true then
         Runtime.RebirthCount = Runtime.RebirthCount + 1
         notify("Rebirth", "Rebirth " .. tostring(Rebirths.Value) .. " complete", "success")
     end
     local t = os.clock()
-    while char and char:GetAttribute("IsRebirthing") == true and os.clock() - t < 20 do beat() task.wait(0.2) end
-    beatWait(2.5)
+    while res == true and os.clock() - t < 8 do
+        beat()
+        if Strength.Value < beforeStrength and alive() and char:GetAttribute("IsRebirthing") ~= true then break end
+        task.wait(0.03)
+    end
     Runtime.Blacklist = {}
     if State.AutoUltimates then pcall(upgradeUltimates) end
     return res == true
@@ -698,7 +723,7 @@ local function rebirthChain(maxCount, spendBoosts)
         Runtime.Status = "Rebirthing (" .. (gained + 1) .. ")"
         if not doRebirth() then break end
         gained = gained + 1
-        task.wait(0.4)
+        task.wait()
     end
     if gained > 1 then
         notify("Rebirth", gained .. " rebirths chained", "success", 5)
@@ -713,7 +738,7 @@ local function requestAutoRebirth()
     spawnTask(function()
         local gained = rebirthChain(50, false)
         Runtime.RebirthBusy = false
-        if gained == 0 and State.FarmMode ~= "Off" and restartFarm then restartFarm() end
+        if State.FarmMode ~= "Off" and restartFarm then restartFarm() end
     end)
     return true
 end
@@ -866,6 +891,18 @@ local function farmStat(token, mode)
     return true
 end
 
+local function teleportToKingsGym()
+    if not alive() or not kingsGymPart then return false end
+    if (hrp.Position - kingsGymPart.Position).Magnitude < 500 then return true end
+    if isMounted() then leaveMachine() end
+    for _ = 1, 3 do
+        if not alive() then return false end
+        anchorAt(kingsGymPart.CFrame * CFrame.new(0, 6, 0))
+        task.wait(0.05)
+    end
+    return (hrp.Position - kingsGymPart.Position).Magnitude < 500
+end
+
 local function startFarm()
     Runtime.FarmToken = Runtime.FarmToken + 1
     local token = Runtime.FarmToken
@@ -981,18 +1018,84 @@ end
 local function collectQuests()
     local root = LocalPlayer:FindFirstChild("Quests")
     if not root then return end
-    for _, group in ipairs(root:GetChildren()) do
-        if group.Name ~= "completedQuests" then
-            for _, quest in ipairs(group:GetChildren()) do
-                if gf("checkForCompleteQuest", quest) == true then
-                    fire(Remotes.Quests, "collectQuest", quest)
-                    Runtime.Claimed = Runtime.Claimed + 1
-                    notify("Quest", quest.Name .. " collected", "success")
-                    task.wait(0.4)
-                end
+
+    for _, quest in ipairs(root:GetDescendants()) do
+        if quest:IsA("Folder") and quest:FindFirstChild("requirements") then
+            if gf("checkForCompleteQuest", quest) == true then
+                fire(Remotes.Quests, "collectQuest", quest)
+                Runtime.Claimed = Runtime.Claimed + 1
+                notify("Quest", quest.Name .. " collected", "success")
+                task.wait(0.4)
             end
         end
     end
+end
+
+local questAcceptCooldown = {}
+
+local function nextNpcQuest(questLine)
+    local root = LocalPlayer:FindFirstChild("Quests")
+    local story = root and root:FindFirstChild("Story Quests")
+    local completed = root and root:FindFirstChild("completedQuests")
+    local catalogQuests = questLine and questLine:FindFirstChild("Quests")
+    if not root or not story or not completed or not catalogQuests then return nil end
+
+    -- An NPC only gives another story quest after its current one is collected.
+    if story:FindFirstChild(questLine.Name) then return nil end
+
+    local finished = completed:FindFirstChild(questLine.Name)
+    local numbers = {}
+    for _, quest in ipairs(catalogQuests:GetChildren()) do
+        local number = tonumber(quest.Name)
+        if number then table.insert(numbers, number) end
+    end
+    table.sort(numbers)
+
+    if not finished then return catalogQuests:FindFirstChild("1") end
+    for _, number in ipairs(numbers) do
+        local name = tostring(number)
+        if not finished:FindFirstChild(name) then
+            return catalogQuests:FindFirstChild(name)
+        end
+    end
+
+    -- Industrial Gains unlocks one rotating quest every 24 hours.
+    if questLine.Name == "Industrial Gains" then
+        local industrial = root:FindFirstChild("Industrial Daily")
+        if industrial and #industrial:GetChildren() > 0 then return nil end
+        local lastDaily = dataIndex("quests", "industrialDailyQuestTime")
+        if type(lastDaily) == "number" and os.time() - lastDaily < 86400 then return nil end
+        local daily = questCatalog:FindFirstChild("Industrial Daily")
+        local today = daily and daily:FindFirstChild(os.date("!%A"))
+        return today and today:GetChildren()[1] or nil
+    end
+    return nil
+end
+
+local function acceptNpcQuests()
+    for _, npc in ipairs(questsNpcs:GetChildren()) do
+        local link = npc:FindFirstChild("questLink")
+        local questLine = link and link:IsA("ObjectValue") and link.Value or nil
+        local required = questLine and questLine:FindFirstChild("Rebirths")
+        if questLine and (not required or required.Value <= Rebirths.Value) then
+            local quest = nextNpcQuest(questLine)
+            local lastRequest = quest and questAcceptCooldown[quest] or 0
+            if quest and os.clock() - lastRequest >= 8 then
+                questAcceptCooldown[quest] = os.clock()
+                local action = quest.Parent and quest.Parent.Parent and quest.Parent.Parent.Name == "Industrial Daily"
+                    and "createNewIndustrialDaily" or "createNewStoryQuest"
+                fire(Remotes.Quests, action, quest)
+                notify("Quest", npc.Name .. " quest accepted", "success")
+                task.wait(0.4)
+            end
+        end
+    end
+end
+
+local function updateNpcQuests()
+    collectQuests()
+    task.wait(0.6)
+    acceptNpcQuests()
 end
 
 local function crystalCost(name)
@@ -1224,7 +1327,7 @@ spawnTask(function()
         if State.AutoGroup and now > nextGroup then nextGroup = now + 120 pcall(claimGroup) end
         if State.AutoGifts and now > nextGift then nextGift = now + 60 pcall(claimGifts) end
         if State.AutoWheel and now > nextWheel then nextWheel = now + 60 pcall(spinWheel) end
-        if State.AutoQuests and now > nextQuest then nextQuest = now + 20 pcall(collectQuests) end
+        if State.AutoQuests and now > nextQuest then nextQuest = now + 10 pcall(updateNpcQuests) end
         task.wait(2)
     end
 end)
@@ -1246,6 +1349,19 @@ spawnTask(function()
             if State.AutoEvolvePets then pcall(evolveReadyPets) end
             if State.AutoEquipPets then pcall(equipBestPets) end
         end
+    end
+end)
+
+spawnTask(function()
+    while running() do
+        elevate()
+        if State.AlwaysKingsGym
+            and State.FarmMode == "Strength"
+            and State.StrengthSource == "Tools (Hotbar)"
+        then
+            pcall(teleportToKingsGym)
+        end
+        task.wait(1)
     end
 end)
 
@@ -1302,6 +1418,13 @@ local farmModeDropdown = GuiLibrary:CreateDropdown(FarmTab, "Choose Stat To Farm
     end
 end)
 
+GuiLibrary:CreateDropdown(FarmTab, "Strength Method", {"Auto (Fastest)", "Machines", "Tools (Best for Rebirth)"}, function(v)
+    State.StrengthSource = v
+    Runtime.Rates = {}
+    Runtime.Blacklist = {}
+    if State.FarmMode == "Strength" then startFarm() end
+end)
+
 local function setFarmMode(mode)
     if farmModeDropdown and farmModeDropdown.SetValue then
         pcall(farmModeDropdown.SetValue, mode)
@@ -1316,7 +1439,7 @@ end
 if State.FarmMode ~= "Off" then setFarmMode("Off") end
 
 GuiLibrary:CreateLabel(FarmTab, "Rotate automatically switches between Strength, Agility, and Durability.")
-GuiLibrary:CreateLabel(FarmTab, "On first start, the script briefly tests available equipment to find the fastest option.")
+GuiLibrary:CreateLabel(FarmTab, "For fast rebirths, choose Tools (Hotbar). Auto picks the highest-yield source.")
 
 GuiLibrary:CreateSection(FarmTab, "Automatic Rebirth")
 
@@ -1359,7 +1482,10 @@ GuiLibrary:CreateToggle(CollectTab, "Auto Chests (6h timers)", false, function(v
 GuiLibrary:CreateToggle(CollectTab, "Auto Group Rewards", false, function(v) State.AutoGroup = v end)
 GuiLibrary:CreateToggle(CollectTab, "Auto Free Gifts (playtime)", false, function(v) State.AutoGifts = v end)
 GuiLibrary:CreateToggle(CollectTab, "Auto Fortune Wheel (free spins)", false, function(v) State.AutoWheel = v end)
-GuiLibrary:CreateToggle(CollectTab, "Auto Collect Quests", false, function(v) State.AutoQuests = v end)
+GuiLibrary:CreateToggle(CollectTab, "Auto Get & Collect NPC Quests", false, function(v)
+    State.AutoQuests = v
+    if v then spawnTask(updateNpcQuests) end
+end)
 
 GuiLibrary:CreateSection(CollectTab, "Manual")
 
@@ -1367,7 +1493,7 @@ GuiLibrary:CreateButton(CollectTab, "Claim All Chests Now", function() spawnTask
 GuiLibrary:CreateButton(CollectTab, "Claim Group Reward Now", function() spawnTask(claimGroup) end)
 GuiLibrary:CreateButton(CollectTab, "Claim Free Gifts Now", function() spawnTask(claimGifts) end)
 GuiLibrary:CreateButton(CollectTab, "Spin Fortune Wheel Now", function() spawnTask(spinWheel) end)
-GuiLibrary:CreateButton(CollectTab, "Collect Completed Quests Now", function() spawnTask(collectQuests) end)
+GuiLibrary:CreateButton(CollectTab, "Get & Collect NPC Quests Now", function() spawnTask(updateNpcQuests) end)
 
 GuiLibrary:CreateSection(PetsTab, "Hatching")
 GuiLibrary:CreateLabel(PetsTab, "Choose a crystal, then use Auto Hatch or a manual hatch button.")
@@ -1473,10 +1599,14 @@ end)
 
 GuiLibrary:CreateSection(MiscTab, "Utility")
 GuiLibrary:CreateLabel(MiscTab, "Anti-AFK and notifications are enabled automatically.")
+GuiLibrary:CreateToggle(MiscTab, "Keep Tool Farming In Muscle King Gym", false, function(v)
+    State.AlwaysKingsGym = v
+    if v then spawnTask(teleportToKingsGym) end
+end)
 
 GuiLibrary:CreateSection(MiscTab, "Teleport")
 
-local areaParts = workspace:FindFirstChild("areaTeleportParts")
+local areaParts = areaTeleportParts
 local areaNames = {}
 if areaParts then
     for _, p in ipairs(areaParts:GetChildren()) do table.insert(areaNames, p.Name) end
@@ -1510,7 +1640,7 @@ GuiLibrary:CreateButton(MiscTab, "Stop Everything", function()
     State.AutoHatch, State.AutoBoosts, State.AutoUltimates = false, false, false
     State.AutoChests, State.AutoGroup, State.AutoGifts, State.AutoWheel, State.AutoQuests = false, false, false, false, false
     State.AutoEquipPets, State.AutoSellPets, State.AutoDeletePets = false, false, false
-    State.AutoEvolvePets, State.AutoRebirth = false, false
+    State.AutoEvolvePets, State.AutoRebirth, State.AlwaysKingsGym = false, false, false
     setFarmMode("Off")
     notify("Auto Farm", "All automation stopped", "warning")
 end)
@@ -1582,6 +1712,7 @@ SESSION.api = {
     generationAlive = generationAlive,
     ui = {farmMode = farmModeDropdown},
     candidateSources = candidateSources,
+    teleportToKingsGym = teleportToKingsGym,
     machineSources = machineSources,
     toolSources = toolSources,
     rebirthTarget = rebirthTarget,
@@ -1590,6 +1721,7 @@ SESSION.api = {
     claimChests = claimChests,
     claimGifts = claimGifts,
     collectQuests = collectQuests,
+    acceptNpcQuests = acceptNpcQuests,
     equipBestPets = equipBestPets,
     deleteSelectedPets = deleteSelectedPets,
     evolveReadyPets = evolveReadyPets,
