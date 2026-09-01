@@ -229,6 +229,7 @@ local Runtime = {
     RebirthCount = 0,
     RebirthBusy = false,
     RebirthReturnArea = nil,
+    RebirthReturnMachine = nil,
     PetFuseBusy = false,
     AreaTravelBusy = false,
     PendingArea = nil,
@@ -238,6 +239,7 @@ local Runtime = {
     AreaAnchor = nil,
     KingGymAnchor = nil,
     ActiveSourceKind = nil,
+    LastEngageReason = nil,
     Heartbeat = 0,
     Rates = {},
     RatesStamp = 0,
@@ -250,6 +252,7 @@ local Runtime = {
 local char, hum, hrp
 local restartFarm
 local travelToArea
+local alive
 
 local function gf(name, ...)
     local packed = table.pack(pcall(GF[name], ...))
@@ -304,7 +307,9 @@ if LocalPlayer.Character then bindCharacter(LocalPlayer.Character) end
 
 LocalPlayer.CharacterAdded:Connect(function(c)
     local rebirthArea = Runtime.RebirthReturnArea
+    local rebirthMachine = Runtime.RebirthReturnMachine
     if rebirthArea then Runtime.RebirthReturnArea = nil end
+    Runtime.RebirthReturnMachine = nil
     local pendingArea = rebirthArea == nil and Runtime.PendingArea or nil
     local restoreArea = pendingArea ~= nil and os.clock() <= Runtime.PendingAreaUntil
     bindCharacter(c)
@@ -318,6 +323,13 @@ LocalPlayer.CharacterAdded:Connect(function(c)
         spawnTask(function()
             Runtime.AreaTravelBusy = false
             if travelToArea then travelToArea(rebirthArea, true) end
+            if rebirthMachine and rebirthMachine.Parent and rebirthMachine:IsA("BasePart") and alive() then
+                hrp.CFrame = rebirthMachine.CFrame * CFrame.new(0, 5, 0)
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.AssemblyAngularVelocity = Vector3.zero
+                Runtime.Target = rebirthMachine.Parent.Name
+                Runtime.Status = "At machine; waiting for rebirth cooldown"
+            end
         end)
     elseif restoreArea then
         Runtime.CurrentArea = pendingArea.id
@@ -333,7 +345,7 @@ LocalPlayer.CharacterAdded:Connect(function(c)
         and not Runtime.AreaTravelBusy and restartFarm then restartFarm() end
 end)
 
-local function alive()
+alive = function()
     return char and char.Parent and hum and hrp and hrp.Parent and hum.Health > 0
 end
 
@@ -786,31 +798,65 @@ end
 
 local function engageMachine(source)
     Runtime.ActiveSourceKind = "outside"
+    Runtime.LastEngageReason = nil
     if not alive() then return false end
+    if char:GetAttribute("IsRebirthing") == true then
+        Runtime.Status = "At machine; waiting for rebirth cooldown"
+        local deadline = os.clock() + 8
+        while alive() and char:GetAttribute("IsRebirthing") == true and os.clock() < deadline do
+            beat()
+            task.wait(0.05)
+        end
+    end
     if isMounted() and not leaveMachine() then
         Runtime.Status = "Stuck on a machine, retrying"
         task.wait(0.1)
         return false
     end
-    for _ = 1, 3 do
-        if not alive() then return false end
+    -- The server validates the player's replicated position. Calling useMachine
+    -- immediately after PivotTo races that replication and returns false/nil even
+    -- though pressing E works. Stay on the same target long enough for the server
+    -- to see us, and retry that target instead of blacklisting it and teleporting
+    -- around the area.
+    local lastReason
+    for attempt = 1, 3 do
+        if not alive() or not source.seat.Parent then return false end
+        if source.seat.Occupant ~= nil and source.seat.Occupant ~= hum then
+            Runtime.LastEngageReason = "occupied"
+            Runtime.Blacklist[source.model] = os.clock() + 0.75
+            return false
+        end
+
+        Runtime.Target = source.label
+        Runtime.Status = attempt == 1
+            and ("Starting " .. source.model.Name)
+            or ("Retrying " .. source.model.Name .. " (" .. attempt .. "/3)")
         beat()
-        anchorAt(source.seat.CFrame * CFrame.new(0, 5, 0))
-        task.wait(0.05)
+        anchorAt(source.seat.CFrame * CFrame.new(0, 3, 0))
+        task.wait(attempt == 1 and 0.25 or 0.18)
+        if not alive() then return false end
+
+        local res, reason = invoke(Remotes.Machine, "useMachine", source.seat)
+        lastReason = reason
+        local deadline = os.clock() + 0.75
+        while alive() and machineInUse.Value ~= source.seat and os.clock() < deadline do
+            beat()
+            task.wait(0.03)
+        end
+        if res == true or machineInUse.Value == source.seat or hum.SeatPart == source.seat then
+            Runtime.Blacklist[source.model] = nil
+            Runtime.LastEngageReason = nil
+            break
+        end
+        if reason == "isKingMachine" then break end
     end
-    local res, reason = invoke(Remotes.Machine, "useMachine", source.seat)
-    if res ~= true then
-        if reason == "isKingMachine" or source.model:GetAttribute("IsKingMachine") == true then
-            Runtime.KingLockedUntil = os.clock() + 120
-        else
-            Runtime.Blacklist[source.model] = os.clock() + 180
+
+    if machineInUse.Value ~= source.seat and hum.SeatPart ~= source.seat then
+        Runtime.LastEngageReason = lastReason or "server position not ready"
+        if lastReason == "isKingMachine" then
+            Runtime.KingLockedUntil = os.clock() + 1
         end
         return false
-    end
-    local deadline = os.clock() + 0.6
-    while machineInUse.Value ~= source.seat and os.clock() < deadline do
-        beat()
-        task.wait(0.03)
     end
     local area = areaForInstance(source.model)
     if area then
@@ -845,6 +891,7 @@ local function engageTool(source)
 end
 
 local function engage(source)
+    Runtime.LastEngageReason = nil
     if source.kind == "machine" then return engageMachine(source) end
     return engageTool(source)
 end
@@ -906,7 +953,7 @@ local function runBenchmark(gainKey, token, list, onlyMissing)
     local parts = {}
     for _, source in ipairs(list) do
         local r = Runtime.Rates[source.key]
-        parts[#parts + 1] = ("%s %s"):format(source.label, r and (r < 0 and "locked" or string.format("%.0f/s", r)) or "?")
+        parts[#parts + 1] = ("%s %s"):format(source.label, r and (r < 0 and "unavailable" or string.format("%.0f/s", r)) or "?")
     end
     Runtime.Bench = table.concat(parts, "  |  ")
 end
@@ -1061,11 +1108,13 @@ local function doRebirth()
     if State.AutoBoosts and State.SaveBigBoosts and Strength.Value < rebirthTarget() then
         useBoosts(true)
     end
+    local returnMachine = machineInUse.Value
     if isMounted() then leaveMachine() end
     local currentFarmArea = AREA_BY_ID[Runtime.CurrentArea]
     local returnArea = currentFarmArea and areaSelected(currentFarmArea) and currentFarmArea or selectedToolArea()
     if not returnArea and State.AlwaysKingsGym then returnArea = AREA_BY_ID["Muscle King Gym"] end
     Runtime.RebirthReturnArea = returnArea
+    Runtime.RebirthReturnMachine = returnArea and returnMachine or nil
     Runtime.PendingArea = nil
     Runtime.PendingAreaUntil = 0
     local beforeStrength = Strength.Value
@@ -1074,7 +1123,10 @@ local function doRebirth()
         Runtime.RebirthCount = Runtime.RebirthCount + 1
         notify("Rebirth", "Rebirth " .. tostring(Rebirths.Value) .. " complete", "success")
     end
-    if res ~= true then Runtime.RebirthReturnArea = nil end
+    if res ~= true then
+        Runtime.RebirthReturnArea = nil
+        Runtime.RebirthReturnMachine = nil
+    end
     local t = os.clock()
     while res == true and os.clock() - t < 8 do
         beat()
@@ -1251,9 +1303,15 @@ local function farmStat(token, mode)
     if not farming(token) then return true end
     Runtime.ActiveSourceKind = source.kind == "machine" and "outside" or "tool"
     if not engage(source) then
-        Runtime.Status = "Locked, trying next: " .. source.label
-        Runtime.Target = "switching"
-        task.wait(0.2)
+        if Runtime.LastEngageReason == "occupied" then
+            Runtime.Status = "Machine occupied; trying another: " .. source.label
+        elseif Runtime.LastEngageReason == "isKingMachine" then
+            Runtime.Status = "King machine rejected; retrying shortly"
+        else
+            Runtime.Status = "Could not start yet; retrying: " .. source.label
+        end
+        Runtime.Target = source.label
+        task.wait(0.15)
         return true
     end
 
