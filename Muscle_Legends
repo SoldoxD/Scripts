@@ -228,6 +228,7 @@ local Runtime = {
     FuseRemaining = 0,
     RebirthCount = 0,
     RebirthBusy = false,
+    RebirthReturnArea = nil,
     PetFuseBusy = false,
     AreaTravelBusy = false,
     PendingArea = nil,
@@ -248,6 +249,7 @@ local Runtime = {
 
 local char, hum, hrp
 local restartFarm
+local travelToArea
 
 local function gf(name, ...)
     local packed = table.pack(pcall(GF[name], ...))
@@ -301,11 +303,23 @@ end
 if LocalPlayer.Character then bindCharacter(LocalPlayer.Character) end
 
 LocalPlayer.CharacterAdded:Connect(function(c)
-    local pendingArea = Runtime.PendingArea
+    local rebirthArea = Runtime.RebirthReturnArea
+    if rebirthArea then Runtime.RebirthReturnArea = nil end
+    local pendingArea = rebirthArea == nil and Runtime.PendingArea or nil
     local restoreArea = pendingArea ~= nil and os.clock() <= Runtime.PendingAreaUntil
     bindCharacter(c)
     Runtime.Blacklist = {}
-    if restoreArea then
+    if rebirthArea then
+        Runtime.CurrentArea = nil
+        Runtime.AreaAnchor = nil
+        Runtime.KingGymAnchor = nil
+        Runtime.Status = "Returning to " .. rebirthArea.id .. " after rebirth"
+        Runtime.AreaTravelBusy = true
+        spawnTask(function()
+            Runtime.AreaTravelBusy = false
+            if travelToArea then travelToArea(rebirthArea, true) end
+        end)
+    elseif restoreArea then
         Runtime.CurrentArea = pendingArea.id
         Runtime.AreaAnchor = hrp.CFrame
         Runtime.KingGymAnchor = pendingArea.id == "Muscle King Gym" and hrp.CFrame or nil
@@ -315,7 +329,8 @@ LocalPlayer.CharacterAdded:Connect(function(c)
         Runtime.KingGymAnchor = nil
     end
     Runtime.Heartbeat = os.clock()
-    if State.FarmMode ~= "Off" and not Runtime.RebirthBusy and not Runtime.AreaTravelBusy and restartFarm then restartFarm() end
+    if not rebirthArea and State.FarmMode ~= "Off" and not Runtime.RebirthBusy
+        and not Runtime.AreaTravelBusy and restartFarm then restartFarm() end
 end)
 
 local function alive()
@@ -682,7 +697,7 @@ local function insideRecordedArea(area)
         and (hrp.Position - Runtime.AreaAnchor.Position).Magnitude <= 1000
 end
 
-local function travelToArea(area)
+travelToArea = function(area, instant)
     if not area or not alive() then return false end
     if insideRecordedArea(area) then
         if area.id == "Muscle King Gym" then Runtime.KingGymAnchor = Runtime.KingGymAnchor or hrp.CFrame end
@@ -709,7 +724,7 @@ local function travelToArea(area)
             end
         end
     end
-    if travelCircle then
+    if travelCircle and not instant then
         invoke(Remotes.Area, "travelToArea", travelCircle)
         local deadline = os.clock() + 2
         while running() and os.clock() < deadline do
@@ -1047,12 +1062,19 @@ local function doRebirth()
         useBoosts(true)
     end
     if isMounted() then leaveMachine() end
+    local currentFarmArea = AREA_BY_ID[Runtime.CurrentArea]
+    local returnArea = currentFarmArea and areaSelected(currentFarmArea) and currentFarmArea or selectedToolArea()
+    if not returnArea and State.AlwaysKingsGym then returnArea = AREA_BY_ID["Muscle King Gym"] end
+    Runtime.RebirthReturnArea = returnArea
+    Runtime.PendingArea = nil
+    Runtime.PendingAreaUntil = 0
     local beforeStrength = Strength.Value
     local res = invoke(Remotes.Rebirth, "rebirthRequest")
     if res == true then
         Runtime.RebirthCount = Runtime.RebirthCount + 1
         notify("Rebirth", "Rebirth " .. tostring(Rebirths.Value) .. " complete", "success")
     end
+    if res ~= true then Runtime.RebirthReturnArea = nil end
     local t = os.clock()
     while res == true and os.clock() - t < 8 do
         beat()
@@ -1263,7 +1285,7 @@ local function farmIntentionallyOutsideKingGym()
     local toolArea = selectedToolArea()
     local toolFarmOutside = (State.FarmMethod == "Tools" or Runtime.ActiveSourceKind == "tool")
         and toolArea ~= nil and toolArea.id ~= "Muscle King Gym"
-    return Runtime.RebirthBusy or Runtime.PetFuseBusy or (State.FarmMode ~= "Off"
+    return Runtime.RebirthBusy or Runtime.PetFuseBusy or Runtime.AreaTravelBusy or (State.FarmMode ~= "Off"
         and (State.FarmMethod == "Machines" or Runtime.ActiveSourceKind == "outside" or toolFarmOutside)
     )
 end
@@ -2063,8 +2085,10 @@ end)
 GuiLibrary:CreateButton(FarmTab, "Rebirth Now", function()
     spawnTask(function()
         local wasFarming = State.FarmMode
+        Runtime.RebirthBusy = true
         Runtime.FarmToken = Runtime.FarmToken + 1
         local gained = rebirthChain(50, true)
+        Runtime.RebirthBusy = false
         notify("Rebirth", gained > 0 and (gained .. " rebirth(s)") or "Denied (not enough strength)",
             gained > 0 and "success" or "error")
         if wasFarming ~= "Off" then startFarm() end
