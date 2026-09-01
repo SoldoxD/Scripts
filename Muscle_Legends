@@ -60,6 +60,7 @@ local Remotes = {
     EquipPet  = rEvents:WaitForChild("equipPetEvent"),
     SellPet   = rEvents:WaitForChild("sellPetEvent"),
     PetEvolve = rEvents:WaitForChild("petEvolveEvent"),
+    PetCraft  = rEvents:WaitForChild("petCraftRemote"),
     Area      = rEvents:WaitForChild("areaTravelRemote"),
     Rejoin    = rEvents:WaitForChild("rejoinServerEvent"),
     Ultimates = rEvents:WaitForChild("ultimatesRemote"),
@@ -68,7 +69,7 @@ local Remotes = {
 local machinesFolder = workspace:WaitForChild("machinesFolder")
 local treadmillsFolder = workspace:WaitForChild("Treadmills")
 local areaTeleportParts = workspace:WaitForChild("areaTeleportParts")
-local kingsGymPart = areaTeleportParts:WaitForChild("beachToMuscleKing")
+local areaCircles = workspace:WaitForChild("areaCircles")
 local crystalPrices = sharedFolder.catalogs.crystalPrices
 local gameUltimates = sharedFolder.catalogs.gameUltimatesFolder
 local fortuneWheel = sharedFolder.catalogs.fortuneWheelChances["Fortune Wheel"]
@@ -83,6 +84,53 @@ local TOOL_STATS = {
     Pushups    = {strengthGain = true, agilityGain = true, durabilityGain = true},
     Handstands = {strengthGain = true, durabilityGain = true},
 }
+
+local AREA_DEFS = {}
+do
+    local aliases = {
+        Beach = {"beach"},
+        ["Tiny Island"] = {"tinyisland", "tiny"},
+        ["Frost Gym"] = {"frost"},
+        ["Mythical Gym"] = {"mythical", "mystic"},
+        ["Eternal Gym"] = {"eternal", "inferno"},
+        ["Legends Gym"] = {"legends", "legend"},
+        ["Jungle Gym"] = {"jungle", "ancient"},
+        ["Industrial Gym"] = {"industrial"},
+        ["Muscle King Gym"] = {"muscleking", "kinggym", "king"},
+    }
+    local byId = {}
+    for _, circle in ipairs(areaCircles:GetChildren()) do
+        local nameValue = circle:FindFirstChild("areaName")
+        local amountValue = circle:FindFirstChild("requiredAmount")
+        local rawName = nameValue and tostring(nameValue.Value) or nil
+        local id = rawName == "Muscle King" and "Muscle King Gym" or rawName
+        if id then
+            local area = byId[id]
+            if not area then
+                area = {
+                id = id,
+                required = amountValue and tonumber(amountValue.Value) or 0,
+                aliases = aliases[id] or {id:lower():gsub("[^%w]", "")},
+                circle = circle,
+                    circles = {},
+                }
+                byId[id] = area
+                AREA_DEFS[#AREA_DEFS + 1] = area
+            end
+            area.circles[#area.circles + 1] = circle
+        end
+    end
+end
+table.sort(AREA_DEFS, function(a, b)
+    if a.required ~= b.required then return a.required < b.required end
+    return a.id < b.id
+end)
+
+local AREA_BY_ID = {}
+for _, area in ipairs(AREA_DEFS) do
+    area.label = ("%s, %d Rebirth%s required"):format(area.id, area.required, area.required == 1 and "" or "s")
+    AREA_BY_ID[area.id] = area
+end
 
 local TIMED_BOOSTS = {["Protein Egg"] = "Protein Egg", ["Tropical Shake"] = "Tropical Shake"}
 local BOOST_ACTIONS = {
@@ -132,6 +180,10 @@ local State = {
     BenchmarkEvery = 600,
     SourcePreference = "Auto (fastest)",
     StrengthSource = "Auto (Fastest)",
+    FarmMethod = "Auto (Fastest)",
+    SelectedMachine = "Auto (Best)",
+    SelectedTool = "Auto (Best)",
+    FarmAreas = {},
     RotateSeconds = 120,
     AutoRebirth = false,
     AutoBoosts = false,
@@ -154,7 +206,8 @@ local State = {
     SellRarities = {},
     AutoDeletePets = false,
     DeletePetNames = {},
-    AutoEvolvePets = false,
+    AutoFusePets = false,
+    FusePetNames = {},
     AlwaysKingsGym = false,
     AntiAFK = true,
     Notify = true,
@@ -171,9 +224,19 @@ local Runtime = {
     Boosts = 0,
     Upgrades = 0,
     Evolved = 0,
+    FuseStatus = "Idle",
+    FuseRemaining = 0,
     RebirthCount = 0,
     RebirthBusy = false,
+    PetFuseBusy = false,
+    AreaTravelBusy = false,
+    PendingArea = nil,
+    PendingAreaUntil = 0,
     KingLockedUntil = 0,
+    CurrentArea = nil,
+    AreaAnchor = nil,
+    KingGymAnchor = nil,
+    ActiveSourceKind = nil,
     Heartbeat = 0,
     Rates = {},
     RatesStamp = 0,
@@ -238,10 +301,21 @@ end
 if LocalPlayer.Character then bindCharacter(LocalPlayer.Character) end
 
 LocalPlayer.CharacterAdded:Connect(function(c)
+    local pendingArea = Runtime.PendingArea
+    local restoreArea = pendingArea ~= nil and os.clock() <= Runtime.PendingAreaUntil
     bindCharacter(c)
     Runtime.Blacklist = {}
+    if restoreArea then
+        Runtime.CurrentArea = pendingArea.id
+        Runtime.AreaAnchor = hrp.CFrame
+        Runtime.KingGymAnchor = pendingArea.id == "Muscle King Gym" and hrp.CFrame or nil
+    else
+        Runtime.CurrentArea = nil
+        Runtime.AreaAnchor = nil
+        Runtime.KingGymAnchor = nil
+    end
     Runtime.Heartbeat = os.clock()
-    if State.FarmMode ~= "Off" and not Runtime.RebirthBusy and restartFarm then restartFarm() end
+    if State.FarmMode ~= "Off" and not Runtime.RebirthBusy and not Runtime.AreaTravelBusy and restartFarm then restartFarm() end
 end)
 
 local function alive()
@@ -293,6 +367,24 @@ local function anchorAt(cf)
     hrp.AssemblyAngularVelocity = Vector3.zero
 end
 
+local function settleOnGround()
+    if not alive() then return false end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {char}
+    params.IgnoreWater = true
+    params.RespectCanCollide = true
+    local result = workspace:Raycast(hrp.Position + Vector3.new(0, 8, 0), Vector3.new(0, -160, 0), params)
+    if not result then return false end
+    local clearance = hum.HipHeight + (hrp.Size.Y / 2) + 0.1
+    local rotation = hrp.CFrame.Rotation
+    anchorAt(CFrame.new(result.Position + Vector3.new(0, clearance, 0)) * rotation)
+    pcall(function() hum.Sit = false end)
+    pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+    task.wait(0.15)
+    return true
+end
+
 local function isMounted()
     return char and (char:GetAttribute("MachineStandingMount") == true
         or char:GetAttribute("MachineScaleFrozen") == true
@@ -339,8 +431,8 @@ local function findTool(name)
     return LocalPlayer.Backpack:FindFirstChild(name) or (char and char:FindFirstChild(name))
 end
 
-local function toolUsable(name)
-    local tool = findTool(name)
+local function toolUsable(toolOrName)
+    local tool = typeof(toolOrName) == "Instance" and toolOrName or findTool(toolOrName)
     if not tool then return false end
     local amount = tool:FindFirstChild("requiredAmount")
     local kind = tool:FindFirstChild("requiredType")
@@ -358,9 +450,138 @@ local function equipTool(name)
     return true
 end
 
-local function heldTool()
-    local t = char and char:FindFirstChildOfClass("Tool")
-    return t and t.Name or nil
+local function equipToolInstance(tool)
+    if not tool or not tool.Parent or not hum then return false end
+    pcall(function() hum:EquipTool(tool) end)
+    return true
+end
+
+local function heldToolInstance()
+    return char and char:FindFirstChildOfClass("Tool") or nil
+end
+
+local function normalizeName(value)
+    return tostring(value or ""):lower():gsub("[^%w]", "")
+end
+
+local function numericValue(value)
+    if type(value) == "number" then return value end
+    if typeof(value) == "Instance" then
+        if value:IsA("IntValue") or value:IsA("NumberValue") then return value.Value end
+    end
+    return nil
+end
+
+local function rebirthRequirement(inst)
+    if not inst then return nil end
+    for name, value in pairs(inst:GetAttributes()) do
+        if normalizeName(name):find("rebirth", 1, true) then
+            local number = numericValue(value)
+            if number then return number end
+        end
+    end
+    for _, child in ipairs(inst:GetDescendants()) do
+        if normalizeName(child.Name):find("rebirth", 1, true) then
+            local number = numericValue(child)
+            if number then return number end
+        end
+    end
+    return nil
+end
+
+local function instancePosition(inst)
+    if not inst then return nil end
+    if inst:IsA("BasePart") then return inst.Position end
+    if inst:IsA("Model") and inst.PrimaryPart then return inst.PrimaryPart.Position end
+    local part = inst:FindFirstChildWhichIsA("BasePart", true)
+    return part and part.Position or nil
+end
+
+local function areaDestinationPad(area)
+    if not area or not areaTeleportParts then return nil end
+    for _, part in ipairs(areaTeleportParts:GetChildren()) do
+        local partName = normalizeName(part.Name)
+        for _, alias in ipairs(area.aliases) do
+            if partName:find("to" .. alias, 1, true) and part:IsA("BasePart") then
+                return part
+            end
+        end
+    end
+    return nil
+end
+
+local function areaForInstance(inst)
+    if not inst then return nil end
+    local name = normalizeName(inst.Name)
+    for i = #AREA_DEFS, 1, -1 do
+        local area = AREA_DEFS[i]
+        for _, alias in ipairs(area.aliases) do
+            if name:find(alias, 1, true) then return area end
+        end
+    end
+    local required = rebirthRequirement(inst)
+    if required ~= nil then
+        local matched, matches
+        matches = 0
+        for _, area in ipairs(AREA_DEFS) do
+            if area.required == required then
+                matched = area
+                matches = matches + 1
+            end
+        end
+        if matches == 1 then return matched end
+    end
+    -- Destination pads live inside their actual farm regions. Only accept a
+    -- spatial match within that region; choosing the globally nearest pad made
+    -- unrelated/hidden machines look like Beach machines.
+    local position = instancePosition(inst)
+    local nearest, nearestDistance
+    if position then
+        for _, area in ipairs(AREA_DEFS) do
+            local pad = areaDestinationPad(area)
+            if pad then
+                local distance = (position - pad.Position).Magnitude
+                if not nearestDistance or distance < nearestDistance then
+                    nearest, nearestDistance = area, distance
+                end
+            end
+        end
+    end
+    if nearest and nearestDistance <= 1600 then return nearest end
+    return nil
+end
+
+local function areaSelected(area)
+    local selected = State.FarmAreas
+    return area and type(selected) == "table"
+        and (selected[area.label] == true or selected[area.id] == true)
+end
+
+local function sourceAreaAllowed(inst)
+    local area = areaForInstance(inst)
+    return area ~= nil and areaSelected(area)
+end
+
+local function machineSelected(inst)
+    if State.FarmMethod ~= "Machines" then return true end
+    local chosen = State.SelectedMachine
+    return chosen == nil or chosen == "Auto (Best)" or (inst and chosen == inst.Name)
+end
+
+local function inventoryTrainingTools()
+    local list, seen = {}, {}
+    local function scan(container)
+        if not container then return end
+        for _, tool in ipairs(container:GetChildren()) do
+            if tool:IsA("Tool") and not seen[tool] then
+                seen[tool] = true
+                list[#list + 1] = tool
+            end
+        end
+    end
+    scan(LocalPlayer.Backpack)
+    scan(char)
+    return list
 end
 
 local function machineSources(gainKey)
@@ -371,7 +592,8 @@ local function machineSources(gainKey)
         local repTime = m:FindFirstChild("repTime")
         local kingLocked = m:GetAttribute("IsKingMachine") == true
             and (Runtime.KingLockedUntil or 0) > os.clock()
-        if gain and seat and seat:IsA("Seat") and not kingLocked and not blacklisted(m) and meetsRequirements(m) then
+        if gain and seat and seat:IsA("Seat") and machineSelected(m) and sourceAreaAllowed(m)
+            and not kingLocked and not blacklisted(m) and meetsRequirements(m) then
             local rt = repTime and repTime.Value or 1
             if rt <= 0 then rt = 1 end
             table.insert(list, {
@@ -387,22 +609,31 @@ end
 
 local function toolSources(gainKey)
     local list = {}
-    for name, stats in pairs(TOOL_STATS) do
-        if stats[gainKey] and toolUsable(name) then
-            local tool = findTool(name)
-            local gain = tool and tool:FindFirstChild(gainKey)
-            local repTime = tool and tool:FindFirstChild("repTime")
+    for _, tool in ipairs(inventoryTrainingTools()) do
+        local stats = TOOL_STATS[tool.Name]
+        local gain = tool:FindFirstChild(gainKey)
+        local supports = (gain and type(gain.Value) == "number") or (stats and stats[gainKey])
+        local chosen = State.FarmMethod ~= "Tools" or State.SelectedTool == nil
+            or State.SelectedTool == "Auto (Best)" or State.SelectedTool == tool.Name
+        if supports and chosen and toolUsable(tool) then
+            local repTime = tool:FindFirstChild("repTime")
             local rt = repTime and repTime.Value or 1
             if rt <= 0 then rt = 1 end
+            local amount = gain and gain.Value or 0
             table.insert(list, {
-                kind = "tool", key = "T:" .. name, toolName = name,
-                gain = gain and gain.Value or 0, repTime = rt,
-                estimate = (gain and gain.Value or 0) / rt,
-                label = name .. " tool",
+                kind = "tool", key = ("T:%s:%s:%s"):format(tool.Name, amount, rt),
+                tool = tool, toolName = tool.Name,
+                gain = amount, repTime = rt, estimate = amount / rt,
+                equipped = tool.Parent == char,
+                label = tool.Name .. " tool",
             })
         end
     end
-    table.sort(list, function(a, b) return a.estimate > b.estimate end)
+    table.sort(list, function(a, b)
+        if a.estimate ~= b.estimate then return a.estimate > b.estimate end
+        if a.equipped ~= b.equipped then return a.equipped end
+        return a.toolName < b.toolName
+    end)
     return list
 end
 
@@ -415,23 +646,131 @@ local function candidateSources(gainKey)
         tools = toolSources(gainKey)
     end
     local out = {}
-    local preference = gainKey == "strengthGain" and State.StrengthSource or State.SourcePreference
-    local toolsOnly = preference == "Tools only" or preference == "Tools (Hotbar)"
-    local machinesOnly = preference == "Machines only" or preference == "Machines"
+    local preference = State.FarmMethod or "Auto (Fastest)"
+    local toolsOnly = preference == "Tools"
+    local machinesOnly = preference == "Machines"
     if not toolsOnly then
         for i = 1, math.min(2, #machines) do table.insert(out, machines[i]) end
     end
     if not machinesOnly then
-        for i = 1, math.min(2, #tools) do table.insert(out, tools[i]) end
+        if tools[1] then table.insert(out, tools[1]) end
     end
     if #out == 0 then
-        for i = 1, math.min(1, #machines) do table.insert(out, machines[i]) end
-        for i = 1, math.min(1, #tools) do table.insert(out, tools[i]) end
+        if not toolsOnly and machines[1] then table.insert(out, machines[1]) end
+        if not machinesOnly and tools[1] then table.insert(out, tools[1]) end
     end
     return out
 end
 
+local function findAreaPad(area)
+    return areaDestinationPad(area)
+end
+
+local function selectedToolArea()
+    local best
+    for _, area in ipairs(AREA_DEFS) do
+        if areaSelected(area) and area.required <= Rebirths.Value
+            and (not best or area.required >= best.required) then
+            best = area
+        end
+    end
+    return best
+end
+
+local function insideRecordedArea(area)
+    return area and alive() and Runtime.CurrentArea == area.id and Runtime.AreaAnchor ~= nil
+        and (hrp.Position - Runtime.AreaAnchor.Position).Magnitude <= 1000
+end
+
+local function travelToArea(area)
+    if not area or not alive() then return false end
+    if insideRecordedArea(area) then
+        if area.id == "Muscle King Gym" then Runtime.KingGymAnchor = Runtime.KingGymAnchor or hrp.CFrame end
+        return true
+    end
+    Runtime.CurrentArea = nil
+    if isMounted() and not leaveMachine() then return false end
+    Runtime.AreaTravelBusy = true
+    Runtime.PendingArea = area
+    Runtime.PendingAreaUntil = os.clock() + 15
+    Runtime.Status = "Travelling to " .. area.id
+    local arrived = false
+    local originalCharacter = char
+    local before = hrp.Position
+
+    local travelCircle = area.circle
+    local nearestCircleDistance
+    for _, circle in ipairs(area.circles or {}) do
+        local position = instancePosition(circle)
+        if position then
+            local distance = (hrp.Position - position).Magnitude
+            if not nearestCircleDistance or distance < nearestCircleDistance then
+                travelCircle, nearestCircleDistance = circle, distance
+            end
+        end
+    end
+    if travelCircle then
+        invoke(Remotes.Area, "travelToArea", travelCircle)
+        local deadline = os.clock() + 2
+        while running() and os.clock() < deadline do
+            if alive() and (char ~= originalCharacter or (hrp.Position - before).Magnitude > 50) then
+                arrived = true
+                break
+            end
+            beat()
+            task.wait(0.1)
+        end
+    end
+
+    if not arrived then
+        local pad = findAreaPad(area)
+        if not pad then
+            Runtime.AreaTravelBusy = false
+            Runtime.PendingArea = nil
+            return false
+        end
+        local deadline = os.clock() + 5
+        while running() and not alive() and os.clock() < deadline do task.wait(0.1) end
+        if alive() then
+            local lift = (pad.Size.Y / 2) + (hrp.Size.Y / 2) + 0.15
+            anchorAt(pad.CFrame * CFrame.new(0, lift, 0))
+            beat()
+            task.wait(0.2)
+            arrived = true
+        end
+    end
+
+    if arrived then
+        task.wait(0.25)
+        settleOnGround()
+        Runtime.CurrentArea = area.id
+        Runtime.AreaAnchor = hrp.CFrame
+        if area.id == "Muscle King Gym" then Runtime.KingGymAnchor = hrp.CFrame end
+        if State.FarmMode == "Off" then Runtime.Status = "At " .. area.id end
+        Runtime.PendingAreaUntil = os.clock() + 3
+        task.delay(3, function()
+            if Runtime.PendingArea == area and os.clock() >= Runtime.PendingAreaUntil then
+                Runtime.PendingArea = nil
+            end
+        end)
+    else
+        Runtime.PendingArea = nil
+    end
+    Runtime.AreaTravelBusy = false
+    return arrived
+end
+
+local teleportToKingsGym
+
+local function prepareToolArea()
+    local area = selectedToolArea()
+    if area then return travelToArea(area) end
+    if State.AlwaysKingsGym then return teleportToKingsGym and teleportToKingsGym() end
+    return true
+end
+
 local function engageMachine(source)
+    Runtime.ActiveSourceKind = "outside"
     if not alive() then return false end
     if isMounted() and not leaveMachine() then
         Runtime.Status = "Stuck on a machine, retrying"
@@ -458,19 +797,36 @@ local function engageMachine(source)
         beat()
         task.wait(0.03)
     end
+    local area = areaForInstance(source.model)
+    if area then
+        Runtime.CurrentArea = area.id
+        Runtime.AreaAnchor = source.seat.CFrame
+    end
     return machineInUse.Value == source.seat
 end
 
 local function engageTool(source)
+    Runtime.ActiveSourceKind = "tool"
     if isMounted() and not leaveMachine() then
         Runtime.Status = "Stuck on a machine, retrying"
         task.wait(0.5)
         return false
     end
+    if not prepareToolArea() then
+        Runtime.Status = "Could not reach a selected farm area"
+        return false
+    end
+    settleOnGround()
+    local currentTool = findTool(source.toolName)
+    if not currentTool then
+        Runtime.Status = "Selected tool is no longer in inventory"
+        return false
+    end
+    source.tool = currentTool
     beat()
-    equipTool(source.toolName)
+    equipToolInstance(currentTool)
     beatWait(0.5)
-    return heldTool() == source.toolName
+    return heldToolInstance() == currentTool
 end
 
 local function engage(source)
@@ -489,7 +845,7 @@ end
 
 local function sourceHealthy(source)
     if source.kind == "machine" then return machineInUse.Value == source.seat end
-    return heldTool() == source.toolName and not isMounted()
+    return heldToolInstance() == source.tool and not isMounted()
 end
 
 local function measureSource(source, gainKey, token)
@@ -768,7 +1124,8 @@ local function bestTreadmill()
     for _, t in ipairs(treadmillsFolder:GetChildren()) do
         local gain = t:FindFirstChild("agilityAmount")
         local part = t:FindFirstChild("treadmillPart")
-        if gain and part and not blacklisted(t) and meetsRequirements(t) then
+        if gain and part and machineSelected(t) and sourceAreaAllowed(t)
+            and not blacklisted(t) and meetsRequirements(t) then
             if not best or gain.Value > best.gain then
                 best = {model = t, part = part, gain = gain.Value}
             end
@@ -783,7 +1140,8 @@ local function bestRock()
         local rock = m:FindFirstChild("Rock")
         local gain = m:FindFirstChild("durabilityGain")
         local need = m:FindFirstChild("neededDurability")
-        if rock and gain and not blacklisted(m) and Durability.Value >= (need and need.Value or 0) then
+        if rock and gain and machineSelected(m) and sourceAreaAllowed(m)
+            and not blacklisted(m) and Durability.Value >= (need and need.Value or 0) then
             if not best or gain.Value > best.gain then
                 best = {model = m, rock = rock, gain = gain.Value, estimate = gain.Value / 1.4}
             end
@@ -795,6 +1153,7 @@ end
 local function farmTreadmill(token, mode)
     local entry = bestTreadmill()
     if not entry then return false end
+    Runtime.ActiveSourceKind = "outside"
     leaveMachine()
     local part = entry.part
     Runtime.Target = entry.model.Name .. " treadmill (+" .. entry.gain .. ")"
@@ -817,6 +1176,7 @@ end
 local function farmRock(token, mode)
     local entry = bestRock()
     if not entry then return false end
+    Runtime.ActiveSourceKind = "outside"
     leaveMachine()
     local rock = entry.rock
     local reach = math.max(rock.Size.X, rock.Size.Z) / 2 - 4
@@ -847,16 +1207,18 @@ local function farmStat(token, mode)
         local treadmill = bestTreadmill()
         local treadRate = treadmill and (treadmill.gain / 3.3) or 0
         local sourceRate = source and (Runtime.Rates[source.key] or source.estimate) or 0
-        if treadmill and treadRate > sourceRate and State.SourcePreference ~= "Tools only" then
+        if treadmill and treadRate > sourceRate and State.FarmMethod ~= "Tools" then
             return farmTreadmill(token, mode)
         end
     end
 
-    if mode == "Durability" and State.SourcePreference == "Rocks only" then
+    if mode == "Durability" and State.FarmMethod == "Machines"
+        and State.SelectedMachine ~= "Auto (Best)" then
         return farmRock(token, mode)
     end
 
     if not source then
+        Runtime.ActiveSourceKind = nil
         if mode == "Durability" and farmRock(token, mode) then return true end
         Runtime.Status = "No usable source for " .. mode
         Runtime.Target = "none"
@@ -865,6 +1227,7 @@ local function farmStat(token, mode)
     end
 
     if not farming(token) then return true end
+    Runtime.ActiveSourceKind = source.kind == "machine" and "outside" or "tool"
     if not engage(source) then
         Runtime.Status = "Locked, trying next: " .. source.label
         Runtime.Target = "switching"
@@ -891,20 +1254,30 @@ local function farmStat(token, mode)
     return true
 end
 
-local function teleportToKingsGym()
-    if not alive() or not kingsGymPart then return false end
-    if (hrp.Position - kingsGymPart.Position).Magnitude < 500 then return true end
-    if isMounted() then leaveMachine() end
-    for _ = 1, 3 do
-        if not alive() then return false end
-        anchorAt(kingsGymPart.CFrame * CFrame.new(0, 6, 0))
-        task.wait(0.05)
-    end
-    return (hrp.Position - kingsGymPart.Position).Magnitude < 500
+local function insideKingsGym()
+    return alive() and Runtime.KingGymAnchor ~= nil
+        and (hrp.Position - Runtime.KingGymAnchor.Position).Magnitude <= 1000
+end
+
+local function farmIntentionallyOutsideKingGym()
+    local toolArea = selectedToolArea()
+    local toolFarmOutside = (State.FarmMethod == "Tools" or Runtime.ActiveSourceKind == "tool")
+        and toolArea ~= nil and toolArea.id ~= "Muscle King Gym"
+    return Runtime.RebirthBusy or Runtime.PetFuseBusy or (State.FarmMode ~= "Off"
+        and (State.FarmMethod == "Machines" or Runtime.ActiveSourceKind == "outside" or toolFarmOutside)
+    )
+end
+
+teleportToKingsGym = function()
+    if not alive() then return false end
+    if insideKingsGym() then return true end
+    Runtime.CurrentArea = nil
+    return travelToArea(AREA_BY_ID["Muscle King Gym"])
 end
 
 local function startFarm()
     Runtime.FarmToken = Runtime.FarmToken + 1
+    Runtime.ActiveSourceKind = nil
     local token = Runtime.FarmToken
     Runtime.Heartbeat = os.clock()
     spawnTask(function()
@@ -935,6 +1308,7 @@ local function startFarm()
         if token == Runtime.FarmToken then
             Runtime.Status = "Idle"
             Runtime.Target = "none"
+            Runtime.ActiveSourceKind = nil
             pcall(leaveMachine)
         end
     end)
@@ -948,6 +1322,7 @@ local function stopFarm(reason)
     Runtime.FarmToken = old + 1
     Runtime.Target = "none"
     Runtime.Status = "Stopping"
+    Runtime.ActiveSourceKind = nil
     spawnTask(function()
         local t = os.clock()
         while Runtime.Exited ~= old and os.clock() - t < 6 do task.wait(0.1) end
@@ -1280,42 +1655,139 @@ local function deleteSelectedPets()
     return deleted
 end
 
-local function unevolvedPetCounts()
-    local counts = {}
+local EMPTY_FUSE_SLOTS = {false, false, false, false}
+
+local function fuseGroups(selection)
+    local grouped = {}
     local folder = LocalPlayer:FindFirstChild("petsFolder")
-    if not folder then return counts end
+    if not folder then return {} end
+    local equipped = equippedSet()
     for _, rarityFolder in ipairs(folder:GetChildren()) do
         for _, pet in ipairs(rarityFolder:GetChildren()) do
-            if pet:IsA("StringValue") and pet:FindFirstChild("evolved") == nil then
-                counts[pet.Name] = (counts[pet.Name] or 0) + 1
+            if pet:IsA("StringValue") and selectedName(selection, pet.Name) and not equipped[pet] then
+                local evolved = pet:FindFirstChild("evolved") ~= nil
+                local key = pet.Name .. (evolved and "\1evolved" or "\1normal")
+                local group = grouped[key]
+                if not group then
+                    group = {name = pet.Name, evolved = evolved, pets = {}}
+                    grouped[key] = group
+                end
+                group.pets[#group.pets + 1] = pet
             end
         end
     end
-    return counts
+    local groups = {}
+    for _, group in pairs(grouped) do
+        if #group.pets >= 4 then groups[#groups + 1] = group end
+    end
+    table.sort(groups, function(a, b)
+        if a.name ~= b.name then return a.name < b.name end
+        if a.evolved ~= b.evolved then return not a.evolved end
+        return false
+    end)
+    return groups
 end
 
-local function evolveReadyPets()
-    local evolved = 0
-    local counts = unevolvedPetCounts()
-    local names = {}
-    for name, count in pairs(counts) do
-        if count >= 5 then names[#names + 1] = name end
+local function atPetMachine(callback)
+    local savedMode = State.FarmMode
+    local wasFarming = savedMode ~= "Off"
+    local savedCFrame = alive() and hrp.CFrame or nil
+    Runtime.PetFuseBusy = true
+    if wasFarming then
+        Runtime.FarmToken = Runtime.FarmToken + 1
+        Runtime.ActiveSourceKind = nil
+        pcall(leaveMachine)
+        task.wait(0.2)
     end
-    table.sort(names)
 
-    for _, name in ipairs(names) do
-        local count = counts[name] or 0
-        while count >= 5 and running() do
-            fire(Remotes.PetEvolve, "evolvePet", name)
-            task.wait(0.8)
-            local after = unevolvedPetCounts()[name] or 0
-            if after >= count then break end
-            evolved = evolved + 1
-            Runtime.Evolved = Runtime.Evolved + 1
-            count = after
-        end
+    local ok, result = pcall(function()
+        local machine = workspace:FindFirstChild("PetMachine")
+        local prompt = machine and machine:FindFirstChild("promptPart", true)
+        if not prompt or not prompt:IsA("BasePart") or not alive() then return 0 end
+        local lift = prompt.Size.Y / 2 + hrp.Size.Y / 2 + 2
+        anchorAt(prompt.CFrame * CFrame.new(0, lift, 0))
+        task.wait(0.25)
+        return callback()
+    end)
+
+    if savedCFrame and alive() then
+        anchorAt(savedCFrame)
+        task.wait(0.15)
     end
-    return evolved
+    Runtime.PetFuseBusy = false
+    if wasFarming and State.FarmMode == savedMode then startFarm() end
+    if not ok then return 0 end
+    return result or 0
+end
+
+local function fuseSelectedPets()
+    local selected = State.FusePetNames
+    if type(selected) ~= "table" then return 0 end
+
+    -- The craft machine has one server-side timed slot. Query/claim that slot
+    -- with empty inputs; the four input instances only belong to craftPets.
+    local current = invoke(Remotes.PetCraft, "getFuse", EMPTY_FUSE_SLOTS)
+    if type(current) ~= "table" then
+        Runtime.FuseStatus = "Could not read fuse state"
+        return 0
+    end
+    if current.Reason == "rateLimited" then
+        Runtime.FuseStatus = "Fuse remote cooling down"
+        return 0
+    end
+    if current.Fuse then
+        local remaining = math.max(tonumber(current.Fuse.RemainingTime) or 0, 0)
+        Runtime.FuseRemaining = remaining
+        if remaining > 0 then
+            Runtime.FuseStatus = ("Waiting %dm %02ds for %s"):format(
+                math.floor(remaining / 60), math.floor(remaining % 60),
+                tostring(current.Fuse.PetName or "fuse reward"))
+            return 0
+        end
+        return atPetMachine(function()
+            local claimed = invoke(Remotes.PetCraft, "claimFuse", EMPTY_FUSE_SLOTS)
+            if type(claimed) == "table" and claimed.Ok then
+                Runtime.FuseRemaining = 0
+                Runtime.FuseStatus = "Reward claimed; preparing next selected group"
+                return 1
+            end
+            Runtime.FuseStatus = "Claim waiting: " .. tostring(type(claimed) == "table" and claimed.Reason or "unknown")
+            return 0
+        end)
+    end
+
+    local groups = fuseGroups(selected)
+    local group = groups[1]
+    if not group then
+        Runtime.FuseRemaining = 0
+        Runtime.FuseStatus = "Need 4 matching unequipped copies"
+        return 0
+    end
+    local batch = {group.pets[1], group.pets[2], group.pets[3], group.pets[4]}
+    return atPetMachine(function()
+        local crafted = invoke(Remotes.PetCraft, "craftPets", batch)
+        if type(crafted) == "table" and crafted.Ok then
+            local remaining = crafted.Fuse and math.max(tonumber(crafted.Fuse.RemainingTime) or 0, 0) or 0
+            Runtime.FuseRemaining = remaining
+            Runtime.FuseStatus = ("Started %s%s fuse (%dm %02ds)"):format(
+                group.evolved and "evolved " or "", group.name,
+                math.floor(remaining / 60), math.floor(remaining % 60))
+            Runtime.Evolved = Runtime.Evolved + 1
+            return 1
+        end
+        Runtime.FuseStatus = "Craft failed: " .. tostring(type(crafted) == "table" and crafted.Reason or "unknown")
+        return 0
+    end)
+end
+
+-- Kept for callers of the older session API; this now performs the actual
+-- four-pet fusion flow instead of the unrelated five-copy evolve event.
+local function evolveReadyPets(selection)
+    local previous = State.FusePetNames
+    State.FusePetNames = selection or previous
+    local fused = fuseSelectedPets()
+    State.FusePetNames = previous
+    return fused
 end
 
 spawnTask(function()
@@ -1342,11 +1814,11 @@ spawnTask(function()
         else
             task.wait(1)
         end
-        if (State.AutoEquipPets or State.AutoSellPets or State.AutoDeletePets or State.AutoEvolvePets) and os.clock() > nextPets then
+        if (State.AutoEquipPets or State.AutoSellPets or State.AutoDeletePets or State.AutoFusePets) and os.clock() > nextPets then
             nextPets = os.clock() + 15
             if State.AutoSellPets then pcall(sellJunkPets) end
             if State.AutoDeletePets then pcall(deleteSelectedPets) end
-            if State.AutoEvolvePets then pcall(evolveReadyPets) end
+            if State.AutoFusePets then pcall(fuseSelectedPets) end
             if State.AutoEquipPets then pcall(equipBestPets) end
         end
     end
@@ -1355,13 +1827,10 @@ end)
 spawnTask(function()
     while running() do
         elevate()
-        if State.AlwaysKingsGym
-            and State.FarmMode == "Strength"
-            and State.StrengthSource == "Tools (Hotbar)"
-        then
+        if State.AlwaysKingsGym and not farmIntentionallyOutsideKingGym() and not insideKingsGym() then
             pcall(teleportToKingsGym)
         end
-        task.wait(1)
+        task.wait(State.AlwaysKingsGym and 0.5 or 1)
     end
 end)
 
@@ -1407,22 +1876,163 @@ local statusLabel = GuiLibrary:CreateLabel(FarmTab, "Status: Idle")
 local targetLabel = GuiLibrary:CreateLabel(FarmTab, "Target: none")
 local benchLabel  = nil
 
+local areaOptions, defaultAreas = {}, {}
+for _, area in ipairs(AREA_DEFS) do
+    areaOptions[#areaOptions + 1] = area.label
+    if area.id == "Beach" then defaultAreas[#defaultAreas + 1] = area.label end
+end
+if #defaultAreas == 0 and AREA_DEFS[1] then defaultAreas[1] = AREA_DEFS[1].label end
+for _, label in ipairs(defaultAreas) do State.FarmAreas[label] = true end
+
+local machineDropdown
+local refreshMachineDropdown
+local toolDropdown
+local refreshToolDropdown
+local updateSourceControls
+
+local farmAreaDropdown = GuiLibrary:CreateMultiSelect(FarmTab, "Farm Areas To Use", areaOptions, defaultAreas, function(selected)
+    State.FarmAreas = selected or {}
+    Runtime.Rates = {}
+    Runtime.Blacklist = {}
+    Runtime.CurrentArea = nil
+    if refreshMachineDropdown then refreshMachineDropdown() end
+    if refreshToolDropdown then refreshToolDropdown() end
+    if State.FarmMode ~= "Off" then startFarm() end
+end)
+
+local function machineOptionsForMode()
+    local mode = State.FarmMode
+    local keys = {}
+    if mode == "Strength" or mode == "Agility" or mode == "Durability" then
+        keys[GAIN_KEY[mode]] = true
+    else
+        for _, key in pairs(GAIN_KEY) do keys[key] = true end
+    end
+    local options, seen = {"Auto (Best)"}, { ["Auto (Best)"] = true }
+    local function consider(inst, specialKey)
+        local supported = specialKey and keys[specialKey]
+        if not supported then
+            for key in pairs(keys) do
+                if inst:FindFirstChild(key) then supported = true break end
+            end
+        end
+        if supported and sourceAreaAllowed(inst) and not seen[inst.Name] then
+            seen[inst.Name] = true
+            options[#options + 1] = inst.Name
+        end
+    end
+    for _, machine in ipairs(machinesFolder:GetChildren()) do consider(machine) end
+    for _, treadmill in ipairs(treadmillsFolder:GetChildren()) do consider(treadmill, "agilityGain") end
+    table.sort(options, function(a, b)
+        if a == b then return false end
+        if a == "Auto (Best)" then return true end
+        if b == "Auto (Best)" then return false end
+        return a < b
+    end)
+    return options
+end
+
+local function toolOptionsForMode()
+    local mode = State.FarmMode
+    local keys = {}
+    if mode == "Strength" or mode == "Agility" or mode == "Durability" then
+        keys[GAIN_KEY[mode]] = true
+    else
+        for _, key in pairs(GAIN_KEY) do keys[key] = true end
+    end
+    local options, seen = {"Auto (Best)"}, { ["Auto (Best)"] = true }
+    for _, tool in ipairs(inventoryTrainingTools()) do
+        local stats = TOOL_STATS[tool.Name]
+        local supported = false
+        for key in pairs(keys) do
+            local gain = tool:FindFirstChild(key)
+            if (gain and type(gain.Value) == "number") or (stats and stats[key]) then
+                supported = true
+                break
+            end
+        end
+        if supported and not seen[tool.Name] then
+            seen[tool.Name] = true
+            options[#options + 1] = tool.Name
+        end
+    end
+    table.sort(options, function(a, b)
+        if a == b then return false end
+        if a == "Auto (Best)" then return true end
+        if b == "Auto (Best)" then return false end
+        return a < b
+    end)
+    return options
+end
+
+refreshMachineDropdown = function()
+    if machineDropdown and machineDropdown.UpdateOptions then
+        machineDropdown.UpdateOptions(machineOptionsForMode(), true)
+    end
+end
+
+refreshToolDropdown = function()
+    if toolDropdown and toolDropdown.UpdateOptions then
+        toolDropdown.UpdateOptions(toolOptionsForMode(), true)
+    end
+end
+
 local farmModeDropdown = GuiLibrary:CreateDropdown(FarmTab, "Choose Stat To Farm", {"Off", "Strength", "Agility", "Durability", "Rotate"}, function(v)
     if v == "Off" then
         stopFarm()
         notify("Auto Farm", "Stopped", "warning")
     else
         State.FarmMode = v
+        if refreshMachineDropdown then refreshMachineDropdown() end
+        if refreshToolDropdown then refreshToolDropdown() end
         startFarm()
         notify("Auto Farm", "Mode set to " .. v, "info")
     end
 end)
 
-GuiLibrary:CreateDropdown(FarmTab, "Strength Method", {"Auto (Fastest)", "Machines", "Tools (Best for Rebirth)"}, function(v)
+local sourceMethodDropdown = GuiLibrary:CreateDropdown(FarmTab, "Farm Method", {"Auto (Fastest)", "Machines", "Tools"}, function(v)
+    State.FarmMethod = v
     State.StrengthSource = v
+    State.SourcePreference = v
     Runtime.Rates = {}
     Runtime.Blacklist = {}
-    if State.FarmMode == "Strength" then startFarm() end
+    if updateSourceControls then updateSourceControls() end
+    if State.FarmMode ~= "Off" then startFarm() end
+end)
+
+machineDropdown = GuiLibrary:CreateDropdown(FarmTab, "Machine To Use", machineOptionsForMode(), function(v)
+    State.SelectedMachine = v
+    Runtime.Rates = {}
+    Runtime.Blacklist = {}
+    if State.FarmMode ~= "Off" then startFarm() end
+end)
+
+toolDropdown = GuiLibrary:CreateDropdown(FarmTab, "Tool To Use", toolOptionsForMode(), function(v)
+    State.SelectedTool = v
+    Runtime.Rates = {}
+    if State.FarmMode ~= "Off" then startFarm() end
+end)
+
+updateSourceControls = function()
+    if machineDropdown and machineDropdown.Frame then
+        machineDropdown.Frame.Visible = State.FarmMethod == "Machines"
+    end
+    if toolDropdown and toolDropdown.Frame then
+        toolDropdown.Frame.Visible = State.FarmMethod == "Tools"
+    end
+end
+updateSourceControls()
+
+spawnTask(function()
+    local lastSignature = ""
+    while running() do
+        local signature = table.concat(toolOptionsForMode(), "\0")
+        if signature ~= lastSignature then
+            lastSignature = signature
+            refreshToolDropdown()
+        end
+        task.wait(2)
+    end
 end)
 
 local function setFarmMode(mode)
@@ -1439,7 +2049,7 @@ end
 if State.FarmMode ~= "Off" then setFarmMode("Off") end
 
 GuiLibrary:CreateLabel(FarmTab, "Rotate automatically switches between Strength, Agility, and Durability.")
-GuiLibrary:CreateLabel(FarmTab, "For fast rebirths, choose Tools (Hotbar). Auto picks the highest-yield source.")
+GuiLibrary:CreateLabel(FarmTab, "Machine and tool selectors only appear for their matching farm method.")
 
 GuiLibrary:CreateSection(FarmTab, "Automatic Rebirth")
 
@@ -1550,7 +2160,7 @@ local currentPetNames = inventoryPetNames()
 if #currentPetNames == 0 then currentPetNames = {"No pets found"} end
 
 GuiLibrary:CreateLabel(PetsTab, "Exact-name delete removes every unequipped copy; equipped and perk pets are protected.")
-GuiLibrary:CreateMultiSelect(PetsTab, "Auto Delete Pet Names", currentPetNames, {}, function(sel)
+local petDeleteDropdown = GuiLibrary:CreateMultiSelect(PetsTab, "Auto Delete Pet Names", currentPetNames, {}, function(sel)
     State.DeletePetNames = sel or {}
 end)
 GuiLibrary:CreateToggle(PetsTab, "Auto Delete Selected Pets", false, function(v) State.AutoDeletePets = v end)
@@ -1561,14 +2171,44 @@ GuiLibrary:CreateButton(PetsTab, "Delete Selected Pets Now", function()
     end)
 end)
 
-GuiLibrary:CreateSection(PetsTab, "Pet Evolution")
-GuiLibrary:CreateLabel(PetsTab, "Auto Evolve combines every set of 5 matching unevolved pets.")
-GuiLibrary:CreateToggle(PetsTab, "Auto Evolve All Ready Pets", false, function(v) State.AutoEvolvePets = v end)
-GuiLibrary:CreateButton(PetsTab, "Evolve All Ready Pets Now", function()
+GuiLibrary:CreateSection(PetsTab, "Pet Fusion")
+GuiLibrary:CreateLabel(PetsTab, "Each fuse uses 4 matching copies. Evolved and normal copies share one name entry but are batched separately.")
+local fuseStatusLabel = GuiLibrary:CreateLabel(PetsTab, "Fuse status: " .. Runtime.FuseStatus)
+local petFuseDropdown = GuiLibrary:CreateMultiSelect(PetsTab, "Pets To Auto Fuse", currentPetNames, {}, function(sel)
+    State.FusePetNames = sel or {}
+end)
+GuiLibrary:CreateToggle(PetsTab, "Auto Fuse Selected Pets", false, function(v) State.AutoFusePets = v end)
+GuiLibrary:CreateButton(PetsTab, "Fuse Selected Ready Pets Now", function()
     spawnTask(function()
-        local n = evolveReadyPets()
-        notify("Pet Evolution", n .. " pet(s) evolved", n > 0 and "success" or "warning")
+        local n = fuseSelectedPets()
+        notify("Pet Fusion", n > 0 and Runtime.FuseStatus or ("No action: " .. Runtime.FuseStatus), n > 0 and "success" or "warning")
     end)
+end)
+
+spawnTask(function()
+    local lastSignature = ""
+    while running() do
+        local names = inventoryPetNames()
+        local signature = table.concat(names, "\0")
+        if signature ~= lastSignature then
+            lastSignature = signature
+            if #names == 0 then names = {"No pets found"} end
+            local valid = {}
+            for _, name in ipairs(names) do
+                if name ~= "No pets found" and State.DeletePetNames[name] then valid[name] = true end
+            end
+            petDeleteDropdown.UpdateOptions(names, true)
+            petDeleteDropdown.SetValue(valid)
+            valid = {}
+            for _, name in ipairs(names) do
+                if name ~= "No pets found" and State.FusePetNames[name] then valid[name] = true end
+            end
+            petFuseDropdown.UpdateOptions(names, true)
+            petFuseDropdown.SetValue(valid)
+        end
+        if fuseStatusLabel then fuseStatusLabel.SetText("Fuse status: " .. Runtime.FuseStatus) end
+        task.wait(2)
+    end
 end)
 
 GuiLibrary:CreateSection(StatsTab, "Live Stats")
@@ -1599,32 +2239,29 @@ end)
 
 GuiLibrary:CreateSection(MiscTab, "Utility")
 GuiLibrary:CreateLabel(MiscTab, "Anti-AFK and notifications are enabled automatically.")
-GuiLibrary:CreateToggle(MiscTab, "Keep Tool Farming In Muscle King Gym", false, function(v)
+GuiLibrary:CreateToggle(MiscTab, "Always Stay In Muscle King Gym", false, function(v)
     State.AlwaysKingsGym = v
-    if v then spawnTask(teleportToKingsGym) end
+    Runtime.CurrentArea = nil
+    if v and not farmIntentionallyOutsideKingGym() then spawnTask(teleportToKingsGym) end
+    if State.FarmMode ~= "Off" then startFarm() end
 end)
 
 GuiLibrary:CreateSection(MiscTab, "Teleport")
 
-local areaParts = areaTeleportParts
-local areaNames = {}
-if areaParts then
-    for _, p in ipairs(areaParts:GetChildren()) do table.insert(areaNames, p.Name) end
-    table.sort(areaNames)
-end
-if #areaNames == 0 then areaNames = {"none"} end
+local selectedArea = AREA_DEFS[1]
+GuiLibrary:CreateDropdown(MiscTab, "Area", areaOptions, function(label)
+    for _, area in ipairs(AREA_DEFS) do
+        if area.label == label then selectedArea = area break end
+    end
+end)
 
-local selectedArea = areaNames[1]
-GuiLibrary:CreateDropdown(MiscTab, "Area Pad", areaNames, function(v) selectedArea = v end)
-
-GuiLibrary:CreateButton(MiscTab, "Teleport To Area Pad", function()
+GuiLibrary:CreateButton(MiscTab, "Teleport To Area", function()
     spawnTask(function()
-        if not areaParts then return end
-        local part = areaParts:FindFirstChild(selectedArea)
-        if not part or not alive() then return end
+        if not selectedArea or not alive() then return end
         Runtime.FarmToken = Runtime.FarmToken + 1
-        leaveMachine()
-        for _ = 1, 10 do anchorAt(part.CFrame * CFrame.new(0, 6, 0)) task.wait(0.1) end
+        local ok = travelToArea(selectedArea)
+        notify("Teleport", ok and ("Reached " .. selectedArea.id) or ("Could not reach " .. selectedArea.id),
+            ok and "success" or "error")
         if State.FarmMode ~= "Off" then startFarm() end
     end)
 end)
@@ -1640,7 +2277,7 @@ GuiLibrary:CreateButton(MiscTab, "Stop Everything", function()
     State.AutoHatch, State.AutoBoosts, State.AutoUltimates = false, false, false
     State.AutoChests, State.AutoGroup, State.AutoGifts, State.AutoWheel, State.AutoQuests = false, false, false, false, false
     State.AutoEquipPets, State.AutoSellPets, State.AutoDeletePets = false, false, false
-    State.AutoEvolvePets, State.AutoRebirth, State.AlwaysKingsGym = false, false, false
+    State.AutoFusePets, State.AutoRebirth, State.AlwaysKingsGym = false, false, false
     setFarmMode("Off")
     notify("Auto Farm", "All automation stopped", "warning")
 end)
@@ -1694,7 +2331,7 @@ spawnTask(function()
         end
         if sSession then
             local landed = repsProgress and (repsProgress.Value - repsStart) or 0
-            sSession.SetText(("Reps landed: %d (%.1f/s)   Sent: %d   Hatched: %d   Evolved: %d   Claims: %d   Boosts: %d   Ults: %d   Rebirths: %d")
+            sSession.SetText(("Reps landed: %d (%.1f/s)   Sent: %d   Hatched: %d   Fused: %d   Claims: %d   Boosts: %d   Ults: %d   Rebirths: %d")
                 :format(landed, landed / elapsed, Runtime.Reps, Runtime.Hatched, Runtime.Evolved,
                         Runtime.Claimed, Runtime.Boosts, Runtime.Upgrades, Runtime.RebirthCount))
         end
@@ -1710,7 +2347,8 @@ SESSION.api = {
     stopFarm = stopFarm,
     generation = MY_GENERATION,
     generationAlive = generationAlive,
-    ui = {farmMode = farmModeDropdown},
+    ui = {farmMode = farmModeDropdown, farmMethod = sourceMethodDropdown, farmAreas = farmAreaDropdown,
+        machine = machineDropdown, tool = toolDropdown, fusePets = petFuseDropdown},
     candidateSources = candidateSources,
     teleportToKingsGym = teleportToKingsGym,
     machineSources = machineSources,
@@ -1725,8 +2363,10 @@ SESSION.api = {
     equipBestPets = equipBestPets,
     deleteSelectedPets = deleteSelectedPets,
     evolveReadyPets = evolveReadyPets,
+    fuseSelectedPets = fuseSelectedPets,
+    travelToArea = travelToArea,
     hatchOnce = hatchOnce,
     rebirthChain = rebirthChain,
 }
 
-notify("Muscle Legends", "Auto farm v2 loaded", "success", 4)
+notify("Muscle Legends", "Reworked auto farm loaded", "success", 4)
