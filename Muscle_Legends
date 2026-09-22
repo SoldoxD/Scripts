@@ -195,7 +195,9 @@ local State = {
     AutoGroup = false,
     AutoGifts = false,
     AutoWheel = false,
-    AutoQuests = false,
+    AutoQuests = SESSION.State and SESSION.State.AutoQuests == true or false,
+    AutoEnchantQuest = SESSION.State and SESSION.State.AutoEnchantQuest == true or false,
+    EnchantEvolvePets = SESSION.State and SESSION.State.EnchantEvolvePets == true or false,
     AutoHatch = false,
     HatchCrystal = "Blue Crystal",
     KeepCurrency = 0,
@@ -208,6 +210,7 @@ local State = {
     DeletePetNames = {},
     AutoFusePets = false,
     FusePetNames = {},
+    AutoKillBoss = false,
     AlwaysKingsGym = false,
     AntiAFK = true,
     Notify = true,
@@ -226,11 +229,29 @@ local Runtime = {
     Evolved = 0,
     FuseStatus = "Idle",
     FuseRemaining = 0,
+    EnchantQuestStatus = "Waiting for enchant quest",
+    EnchantBrawlJoined = false,
+    EnchantBrawlLastTry = 0,
+    EnchantBrawlProgressAtTry = 0,
+    EnchantEvolveSpent = 0,
+    EnchantEvolveQuest = nil,
+    EnchantEvolveNextTry = 0,
+    EnchantEvolveAction = "waiting",
+    EnchantFarmSaved = nil :: any,
     RebirthCount = 0,
+    RebirthRepRequests = 0,
+    FastRebirthAttempts = 0,
+    FastRebirthRejects = 0,
     RebirthBusy = false,
     RebirthReturnArea = nil,
     RebirthReturnMachine = nil,
+    RebirthRecoveryUntil = 0,
     PetFuseBusy = false,
+    BossBusy = false,
+    BossToken = 0,
+    BossStatus = "Waiting for boss",
+    BossDamage = 0,
+    BossKills = 0,
     AreaTravelBusy = false,
     PendingArea = nil,
     PendingAreaUntil = 0,
@@ -248,6 +269,8 @@ local Runtime = {
     StartStats = {Strength = Strength.Value, Agility = Agility.Value, Durability = Durability.Value},
     Blacklist = {},
 }
+local Enchant = {}
+Enchant.EvolveSpendLimit = 300000
 
 local char, hum, hrp
 local restartFarm
@@ -259,6 +282,41 @@ local function gf(name, ...)
     elevate()
     if packed[1] then return table.unpack(packed, 2, packed.n) end
     return nil
+end
+
+function Enchant.objective()
+    local quests = LocalPlayer:FindFirstChild("Quests")
+    local folder = quests and quests:FindFirstChild("Enchant Quests")
+    if not folder then return nil end
+    for _, quest in ipairs(folder:GetChildren()) do
+        local requirements = quest:FindFirstChild("requirements")
+        if requirements then
+            for _, requirement in ipairs(requirements:GetChildren()) do
+                if requirement:IsA("NumberValue") or requirement:IsA("IntValue") then
+                    local progress = requirement:FindFirstChild("progress")
+                    return quest, requirement.Name, tonumber(progress and progress.Value) or 0,
+                        tonumber(requirement.Value) or 0
+                end
+            end
+        end
+    end
+    return nil
+end
+
+function Enchant.wantsBoss()
+    if not State.AutoEnchantQuest then return false end
+    local _, objective, progress, goal = Enchant.objective()
+    return objective == "Bosses Defeated" and progress < goal
+end
+
+function Enchant.wantsEvolve()
+    if not State.AutoEnchantQuest or not State.EnchantEvolvePets then return false end
+    local _, objective, progress, goal = Enchant.objective()
+    return objective == "Evolves" and progress < goal
+end
+
+function Enchant.bossWanted()
+    return State.AutoKillBoss or Enchant.wantsBoss()
 end
 
 local function invoke(remote, ...)
@@ -341,7 +399,7 @@ LocalPlayer.CharacterAdded:Connect(function(c)
         Runtime.KingGymAnchor = nil
     end
     Runtime.Heartbeat = os.clock()
-    if not rebirthArea and State.FarmMode ~= "Off" and not Runtime.RebirthBusy
+    if not rebirthArea and State.FarmMode ~= "Off" and not Runtime.RebirthBusy and not Runtime.BossBusy
         and not Runtime.AreaTravelBusy and restartFarm then restartFarm() end
 end)
 
@@ -394,7 +452,7 @@ local function anchorAt(cf)
     hrp.AssemblyAngularVelocity = Vector3.zero
 end
 
-local function settleOnGround()
+local function settleOnGround(skipWait)
     if not alive() then return false end
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
@@ -408,7 +466,7 @@ local function settleOnGround()
     anchorAt(CFrame.new(result.Position + Vector3.new(0, clearance, 0)) * rotation)
     pcall(function() hum.Sit = false end)
     pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
-    task.wait(0.15)
+    if not skipWait then task.wait(0.15) end
     return true
 end
 
@@ -558,9 +616,6 @@ local function areaForInstance(inst)
         end
         if matches == 1 then return matched end
     end
-    -- Destination pads live inside their actual farm regions. Only accept a
-    -- spatial match within that region; choosing the globally nearest pad made
-    -- unrelated/hidden machines look like Beach machines.
     local position = instancePosition(inst)
     local nearest, nearestDistance
     if position then
@@ -640,8 +695,10 @@ local function toolSources(gainKey)
         local stats = TOOL_STATS[tool.Name]
         local gain = tool:FindFirstChild(gainKey)
         local supports = (gain and type(gain.Value) == "number") or (stats and stats[gainKey])
-        local chosen = State.FarmMethod ~= "Tools" or State.SelectedTool == nil
-            or State.SelectedTool == "Auto (Best)" or State.SelectedTool == tool.Name
+        local normalDumbbellOnly = State.FarmMethod == "Tools" and gainKey == "strengthGain"
+        local chosen = normalDumbbellOnly and tool.Name == "Weight"
+            or (not normalDumbbellOnly and (State.FarmMethod ~= "Tools" or State.SelectedTool == nil
+                or State.SelectedTool == "Auto (Best)" or State.SelectedTool == tool.Name))
         if supports and chosen and toolUsable(tool) then
             local repTime = tool:FindFirstChild("repTime")
             local rt = repTime and repTime.Value or 1
@@ -762,14 +819,14 @@ travelToArea = function(area, instant)
             local lift = (pad.Size.Y / 2) + (hrp.Size.Y / 2) + 0.15
             anchorAt(pad.CFrame * CFrame.new(0, lift, 0))
             beat()
-            task.wait(0.2)
+            if not instant then task.wait(0.2) end
             arrived = true
         end
     end
 
     if arrived then
-        task.wait(0.25)
-        settleOnGround()
+        if not instant then task.wait(0.25) end
+        settleOnGround(instant)
         Runtime.CurrentArea = area.id
         Runtime.AreaAnchor = hrp.CFrame
         if area.id == "Muscle King Gym" then Runtime.KingGymAnchor = hrp.CFrame end
@@ -791,7 +848,15 @@ local teleportToKingsGym
 
 local function prepareToolArea()
     local area = selectedToolArea()
-    if area then return travelToArea(area) end
+    if area then
+        local deadline = os.clock() + 0.4
+        while Runtime.AreaTravelBusy and alive() and os.clock() < deadline do
+            beat()
+            task.wait(0.02)
+        end
+        if Runtime.AreaTravelBusy then return false end
+        return travelToArea(area, os.clock() < Runtime.RebirthRecoveryUntil)
+    end
     if State.AlwaysKingsGym then return teleportToKingsGym and teleportToKingsGym() end
     return true
 end
@@ -813,11 +878,6 @@ local function engageMachine(source)
         task.wait(0.1)
         return false
     end
-    -- The server validates the player's replicated position. Calling useMachine
-    -- immediately after PivotTo races that replication and returns false/nil even
-    -- though pressing E works. Stay on the same target long enough for the server
-    -- to see us, and retry that target instead of blacklisting it and teleporting
-    -- around the area.
     local lastReason
     for attempt = 1, 3 do
         if not alive() or not source.seat.Parent then return false end
@@ -877,16 +937,21 @@ local function engageTool(source)
         Runtime.Status = "Could not reach a selected farm area"
         return false
     end
-    settleOnGround()
     local currentTool = findTool(source.toolName)
     if not currentTool then
         Runtime.Status = "Selected tool is no longer in inventory"
         return false
     end
     source.tool = currentTool
+    if heldToolInstance() == currentTool then return true end
+    settleOnGround(true)
     beat()
     equipToolInstance(currentTool)
-    beatWait(0.5)
+    local deadline = os.clock() + 0.4
+    while alive() and heldToolInstance() ~= currentTool and os.clock() < deadline do
+        beat()
+        task.wait(0.02)
+    end
     return heldToolInstance() == currentTool
 end
 
@@ -961,8 +1026,6 @@ end
 local function pickSource(gainKey, token)
     local list = candidateSources(gainKey)
     if #list == 0 then return nil end
-    -- Strength sources all use the same player multipliers, so gain / repTime
-    -- ranks them exactly without a long benchmark after every rebirth.
     if State.AutoBenchmark and gainKey ~= "strengthGain" then
         local full = os.clock() - Runtime.RatesStamp > State.BenchmarkEvery
         if full then Runtime.Rates = {} end
@@ -993,8 +1056,8 @@ local function rebirthTarget()
     return math.huge
 end
 
-local function canRebirth()
-    if char and char:GetAttribute("IsRebirthing") == true then return false end
+local function canRebirth(allowDuringRebirth)
+    if not allowDuringRebirth and char and char:GetAttribute("IsRebirthing") == true then return false end
     if LocalPlayer:GetAttribute("LastMapCFrame") ~= nil then return false end
     return Strength.Value >= rebirthTarget()
 end
@@ -1115,9 +1178,11 @@ local function doRebirth()
     if not returnArea and State.AlwaysKingsGym then returnArea = AREA_BY_ID["Muscle King Gym"] end
     Runtime.RebirthReturnArea = returnArea
     Runtime.RebirthReturnMachine = returnArea and returnMachine or nil
+    Runtime.RebirthRecoveryUntil = os.clock() + 12
     Runtime.PendingArea = nil
     Runtime.PendingAreaUntil = 0
     local beforeStrength = Strength.Value
+    local beforeRebirths = Rebirths.Value
     local res = invoke(Remotes.Rebirth, "rebirthRequest")
     if res == true then
         Runtime.RebirthCount = Runtime.RebirthCount + 1
@@ -1126,11 +1191,16 @@ local function doRebirth()
     if res ~= true then
         Runtime.RebirthReturnArea = nil
         Runtime.RebirthReturnMachine = nil
+        Runtime.RebirthRecoveryUntil = 0
     end
     local t = os.clock()
+    local sawReset, sawLock = false, false
     while res == true and os.clock() - t < 8 do
         beat()
-        if Strength.Value < beforeStrength and alive() and char:GetAttribute("IsRebirthing") ~= true then break end
+        if Rebirths.Value > beforeRebirths or Strength.Value < beforeStrength then sawReset = true end
+        local rebirthing = char and char:GetAttribute("IsRebirthing") == true
+        if rebirthing then sawLock = true end
+        if sawReset and alive() and not rebirthing and (sawLock or os.clock() - t > 1) then break end
         task.wait(0.03)
     end
     Runtime.Blacklist = {}
@@ -1138,8 +1208,52 @@ local function doRebirth()
     return res == true
 end
 
-local function rebirthChain(maxCount, spendBoosts)
+local function rebirthChain(maxCount, spendBoosts, fastTools)
     maxCount = maxCount or 50
+    if fastTools then
+        local gained, nextAttempt = 0, 0
+        local targetRebirths, target = nil, math.huge
+        while running() and State.AutoRebirth and State.FarmMode == "Strength"
+            and State.FarmMethod == "Tools" and not Runtime.BossBusy and gained < maxCount do
+            beat()
+            if Rebirths.Value ~= targetRebirths then
+                targetRebirths = Rebirths.Value
+                target = rebirthTarget()
+            end
+            if alive() and Strength.Value >= target and LocalPlayer:GetAttribute("LastMapCFrame") == nil
+                and os.clock() >= nextAttempt then
+                if isMounted() then leaveMachine() end
+                local previousArea = Runtime.RebirthReturnArea
+                local previousMachine = Runtime.RebirthReturnMachine
+                local currentArea = AREA_BY_ID[Runtime.CurrentArea]
+                local returnArea = currentArea and areaSelected(currentArea) and currentArea or selectedToolArea()
+                if not returnArea and State.AlwaysKingsGym then returnArea = AREA_BY_ID["Muscle King Gym"] end
+                Runtime.RebirthReturnArea = returnArea
+                Runtime.RebirthReturnMachine = nil
+                Runtime.Status = "Requesting rebirth (" .. (gained + 1) .. ")"
+                Runtime.FastRebirthAttempts = Runtime.FastRebirthAttempts + 1
+                local res = invoke(Remotes.Rebirth, "rebirthRequest")
+                if res == true then
+                    gained = gained + 1
+                    Runtime.RebirthCount = Runtime.RebirthCount + 1
+                    Runtime.RebirthRecoveryUntil = os.clock() + 12
+                    Runtime.Status = "Rebirthing (" .. gained .. ")"
+                    notify("Rebirth", "Rebirth " .. tostring(Rebirths.Value) .. " complete", "success")
+                    if State.AutoUltimates then pcall(upgradeUltimates) end
+                    nextAttempt = os.clock() + 0.05
+                else
+                    Runtime.RebirthReturnArea = previousArea
+                    Runtime.RebirthReturnMachine = previousMachine
+                    Runtime.FastRebirthRejects = Runtime.FastRebirthRejects + 1
+                    Runtime.Status = "Rebirth ready; waiting for server"
+                    nextAttempt = os.clock() + 0.1
+                end
+            end
+            task.wait(0.03)
+        end
+        if gained > 1 then notify("Rebirth", gained .. " rebirths chained", "success", 5) end
+        return gained
+    end
     local gained = 0
     for _ = 1, maxCount do
         if not running() then break end
@@ -1162,11 +1276,13 @@ local function rebirthChain(maxCount, spendBoosts)
 end
 
 local function requestAutoRebirth()
-    if not running() or not State.AutoRebirth or Runtime.RebirthBusy or not canRebirth() then return false end
+    local fastTools = State.FarmMode == "Strength" and State.FarmMethod == "Tools"
+    if not running() or not State.AutoRebirth or Runtime.RebirthBusy or Runtime.BossBusy
+        or not canRebirth(fastTools) then return false end
     Runtime.RebirthBusy = true
     Runtime.FarmToken = Runtime.FarmToken + 1
     spawnTask(function()
-        local gained = rebirthChain(50, false)
+        local gained = rebirthChain(50, false, fastTools)
         Runtime.RebirthBusy = false
         if State.FarmMode ~= "Off" and restartFarm then restartFarm() end
     end)
@@ -1175,6 +1291,30 @@ end
 
 Strength.Changed:Connect(function()
     if running() and State.AutoRebirth then requestAutoRebirth() end
+end)
+
+spawnTask(function()
+    local lastEquipTry = 0
+    while running() do
+        if Runtime.RebirthBusy and State.FarmMode == "Strength" and State.FarmMethod == "Tools"
+            and not Runtime.BossBusy and alive() and not isMounted() then
+            local held = heldToolInstance()
+            if held and held.Name == "Weight" then
+                local ok = pcall(muscleEvent.FireServer, muscleEvent, "rep")
+                elevate()
+                if ok then
+                    Runtime.Reps = Runtime.Reps + 1
+                    Runtime.RebirthRepRequests = Runtime.RebirthRepRequests + 1
+                end
+            elseif os.clock() - lastEquipTry >= 0.1 then
+                lastEquipTry = os.clock()
+                equipTool("Weight")
+            end
+            task.wait(math.max(0.03, State.RepDelay))
+        else
+            task.wait(0.05)
+        end
+    end
 end)
 
 spawnTask(function()
@@ -1294,7 +1434,8 @@ local function farmStat(token, mode)
     if not source then
         Runtime.ActiveSourceKind = nil
         if mode == "Durability" and farmRock(token, mode) then return true end
-        Runtime.Status = "No usable source for " .. mode
+        Runtime.Status = mode == "Strength" and State.FarmMethod == "Tools"
+            and "Normal dumbbell (Weight) missing or unusable" or "No usable source for " .. mode
         Runtime.Target = "none"
         task.wait(2)
         return true
@@ -1320,9 +1461,14 @@ local function farmStat(token, mode)
     Runtime.Status = (source.kind == "machine") and "Lifting" or "Exercising"
 
     local chore = os.clock() + 90
+    local toolArea = source.kind == "tool" and selectedToolArea() or nil
     while farming(token) and resolveMode() == mode do
         if not alive() then return true end
         if not sourceHealthy(source) then return true end
+        if toolArea and not insideRecordedArea(toolArea) then
+            Runtime.Status = "Returning to " .. toolArea.id
+            return true
+        end
         Runtime.Heartbeat = os.clock()
         repOnce(source)
         if requestAutoRebirth() then
@@ -1343,7 +1489,7 @@ local function farmIntentionallyOutsideKingGym()
     local toolArea = selectedToolArea()
     local toolFarmOutside = (State.FarmMethod == "Tools" or Runtime.ActiveSourceKind == "tool")
         and toolArea ~= nil and toolArea.id ~= "Muscle King Gym"
-    return Runtime.RebirthBusy or Runtime.PetFuseBusy or Runtime.AreaTravelBusy or (State.FarmMode ~= "Off"
+    return Runtime.RebirthBusy or Runtime.PetFuseBusy or Runtime.BossBusy or Runtime.AreaTravelBusy or (State.FarmMode ~= "Off"
         and (State.FarmMethod == "Machines" or Runtime.ActiveSourceKind == "outside" or toolFarmOutside)
     )
 end
@@ -1352,10 +1498,11 @@ teleportToKingsGym = function()
     if not alive() then return false end
     if insideKingsGym() then return true end
     Runtime.CurrentArea = nil
-    return travelToArea(AREA_BY_ID["Muscle King Gym"])
+    return travelToArea(AREA_BY_ID["Muscle King Gym"], true)
 end
 
 local function startFarm()
+    if Runtime.BossBusy then return end
     Runtime.FarmToken = Runtime.FarmToken + 1
     Runtime.ActiveSourceKind = nil
     local token = Runtime.FarmToken
@@ -1418,6 +1565,250 @@ local function stopFarm(reason)
         end
     end)
 end
+
+local Boss = {CollectionService = game:GetService("CollectionService")}
+
+function Boss.arena()
+    local events = workspace:FindFirstChild("Events")
+    return events and events:FindFirstChild("BossArena")
+end
+
+function Boss.findActive()
+    if workspace:GetAttribute("BossActive") == false then return nil end
+    local arena = Boss.arena()
+    for _, boss in ipairs(Boss.CollectionService:GetTagged("BossEventBoss")) do
+        local health = boss:GetAttribute("Health")
+        if boss:IsA("Model") and boss:IsDescendantOf(workspace) and type(health) == "number" and health > 0 then
+            return boss
+        end
+    end
+    if arena then
+        for _, boss in ipairs(arena:GetChildren()) do
+            local health = boss:GetAttribute("Health")
+            if boss:IsA("Model") and type(health) == "number" and health > 0 then return boss end
+        end
+    end
+    return nil
+end
+
+function Boss.spawn(arena)
+    for _, part in ipairs(Boss.CollectionService:GetTagged("BossArenaSpawn")) do
+        if part:IsA("BasePart") and part:IsDescendantOf(arena) then return part end
+    end
+    local fallback = arena and arena:FindFirstChild("BossSpawn", true)
+    return fallback and fallback:IsA("BasePart") and fallback or nil
+end
+
+function Boss.standHeight()
+    local hipHeight = hum and hum.Parent and hum.HipHeight or 2
+    local halfRoot = hrp and hrp.Parent and hrp.Size.Y / 2 or 1
+    return math.max(hipHeight + halfRoot, 3)
+end
+
+function Boss.dodgeCFrame(arena, attackCFrame)
+    local spawn = Boss.spawn(arena)
+    local center = spawn and spawn.Position or arena:GetPivot().Position
+    for _, base in ipairs(Boss.CollectionService:GetTagged("BossArenaBase")) do
+        if base:IsA("Model") and base:IsDescendantOf(arena) then
+            center = base:GetPivot().Position
+            break
+        end
+    end
+    local attackPosition = attackCFrame.Position
+    local away = Vector3.new(center.X - attackPosition.X, 0, center.Z - attackPosition.Z)
+    if away.Magnitude < 1 then away = Vector3.new(1, 0, 0) end
+    local floorY = spawn and spawn.Position.Y + Boss.standHeight() + 2 or center.Y + Boss.standHeight()
+    local safePosition = Vector3.new(center.X, floorY, center.Z) + away.Unit * 235
+    return CFrame.lookAt(safePosition, Vector3.new(attackPosition.X, floorY, attackPosition.Z))
+end
+
+function Boss.footCFrame(boss, arena, hitbox)
+    local body = boss:FindFirstChild("Boss")
+    if body and body:IsA("BasePart") then
+        local foot = body.CFrame:PointToWorldSpace(Vector3.new(-body.Size.X * 0.22, -body.Size.Y / 2 + 8, 0))
+        local rootPosition = foot + Vector3.new(0, Boss.standHeight(), 0)
+        return CFrame.lookAt(rootPosition, Vector3.new(body.Position.X, rootPosition.Y, body.Position.Z))
+    end
+    local spawn = Boss.spawn(arena)
+    local floorY = spawn and spawn.Position.Y + Boss.standHeight() + 2 or arena:GetPivot().Position.Y + Boss.standHeight()
+    local fallback = Vector3.new(hitbox.Position.X, floorY, hitbox.Position.Z)
+    return CFrame.lookAt(fallback, fallback + Vector3.new(0, 0, -1))
+end
+
+function Boss.enter(arena)
+    if not alive() then return false end
+    if char:GetAttribute("InBossArena") == true then return true end
+    local spawn = Boss.spawn(arena)
+    if not spawn then return false end
+    pcall(function() leaveMachine() end)
+    if not alive() then return false end
+    char:PivotTo(spawn.CFrame * CFrame.new(0, Boss.standHeight() + 2, 0))
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.AssemblyAngularVelocity = Vector3.zero
+    local deadline = os.clock() + 2
+    while alive() and Enchant.bossWanted() and char:GetAttribute("InBossArena") ~= true and os.clock() < deadline do
+        beat()
+        task.wait(0.05)
+    end
+    return alive() and char:GetAttribute("InBossArena") == true
+end
+
+function Boss.contribution(boss)
+    local damageValues = boss and boss:FindFirstChild("damageValues")
+    local value = damageValues and damageValues:FindFirstChild(LocalPlayer.Name)
+    return value and tonumber(value.Value) or 0
+end
+
+function Boss.kill(boss)
+    if Runtime.BossBusy or not boss or not boss.Parent then return false end
+    Runtime.BossBusy = true
+    Runtime.BossToken = Runtime.BossToken + 1
+    local token = Runtime.BossToken
+    local savedCFrame = alive() and hrp.CFrame or nil
+    local oldFarmToken = Runtime.FarmToken
+    Runtime.FarmToken = oldFarmToken + 1
+    Runtime.ActiveSourceKind = "outside"
+    Runtime.Status = "Pausing farm for boss"
+    Runtime.Target = boss.Name
+
+    local exitDeadline = os.clock() + 2
+    while Runtime.Exited ~= oldFarmToken and os.clock() < exitDeadline do task.wait(0.05) end
+    if alive() and isMounted() then pcall(leaveMachine) end
+
+    local startingDamage = Boss.contribution(boss)
+    local countedKill = false
+    local nextAttack = 0
+    local nextEquip = 0
+    local nextTrack = 0
+    local engageReadyAt = 0
+    while running() and Enchant.bossWanted() and Runtime.BossToken == token and boss.Parent do
+        local health = tonumber(boss:GetAttribute("Health")) or 0
+        if health <= 0 then
+            countedKill = true
+            break
+        end
+        if not alive() then
+            Runtime.BossStatus = "Respawning for boss"
+            Runtime.Status = Runtime.BossStatus
+            task.wait(0.2)
+        else
+            local arena = Boss.arena()
+            if not arena or not Boss.enter(arena) then
+                Runtime.BossStatus = "Waiting to enter boss arena"
+                Runtime.Status = Runtime.BossStatus
+                task.wait(0.25)
+            elseif boss:GetAttribute("BossEmerging") == true then
+                Runtime.BossStatus = "Boss is emerging"
+                Runtime.Status = Runtime.BossStatus
+                task.wait(0.1)
+            else
+                local hitbox = boss:FindFirstChild("BossDamageHitbox")
+                local punch = findTool("Punch")
+                if not hitbox or not hitbox:IsA("BasePart") then
+                    Runtime.BossStatus = "Waiting for boss hitbox"
+                    Runtime.Status = Runtime.BossStatus
+                    task.wait(0.1)
+                elseif not punch then
+                    Runtime.BossStatus = "Punch tool is missing"
+                    Runtime.Status = Runtime.BossStatus
+                    task.wait(1)
+                else
+                    if punch.Parent ~= char and os.clock() >= nextEquip then
+                        nextEquip = os.clock() + 0.5
+                        pcall(function() hum:EquipTool(punch) end)
+                    end
+                    pcall(function() hrp.Anchored = false end)
+                    local impactTime = tonumber(boss:GetAttribute("BossAttackImpactTime"))
+                    local attackCFrame = boss:GetAttribute("BossAttackCFrame")
+                    local untilImpact = impactTime and (impactTime - workspace:GetServerTimeNow()) or math.huge
+                    local dodging = typeof(attackCFrame) == "CFrame" and untilImpact <= 1.1 and untilImpact >= -0.35
+                    if dodging then
+                        char:PivotTo(Boss.dodgeCFrame(arena, attackCFrame))
+                        nextTrack = 0
+                        engageReadyAt = os.clock() + 0.25
+                        nextAttack = math.max(nextAttack, os.clock() + 0.1)
+                        Runtime.BossStatus = "Dodging " .. tostring(boss:GetAttribute("BossAttackKind") or "boss attack")
+                        Runtime.Status = Runtime.BossStatus
+                    else
+                        if os.clock() >= nextTrack then
+                            char:PivotTo(Boss.footCFrame(boss, arena, hitbox))
+                            nextTrack = os.clock() + 0.35
+                            engageReadyAt = os.clock() + 0.25
+                        end
+                    end
+                    hrp.AssemblyLinearVelocity = Vector3.zero
+                    hrp.AssemblyAngularVelocity = Vector3.zero
+                    if not dodging and punch.Parent == char and os.clock() >= nextAttack and os.clock() >= engageReadyAt then
+                        local attackTime = punch:FindFirstChild("attackTime")
+                        nextAttack = os.clock() + math.max(tonumber(attackTime and attackTime.Value) or 0.35, 0.31)
+                        pcall(function() punch:Activate() end)
+                        Runtime.Reps = Runtime.Reps + 1
+                    end
+                    Runtime.BossDamage = math.max(Boss.contribution(boss) - startingDamage, 0)
+                    if not dodging then
+                        Runtime.BossStatus = ("Fighting %s | HP %s/%s | Damage %s"):format(
+                            workspace:GetAttribute("BossDisplayName") or boss.Name,
+                            short(health), short(tonumber(boss:GetAttribute("MaxHealth")) or health), short(Runtime.BossDamage))
+                        Runtime.Status = Runtime.BossStatus
+                    end
+                    Runtime.Target = boss.Name
+                    beat()
+                    task.wait(0.03)
+                end
+            end
+        end
+    end
+
+    Runtime.BossDamage = math.max(Boss.contribution(boss) - startingDamage, 0)
+    if countedKill then
+        Runtime.BossKills = Runtime.BossKills + 1
+        Runtime.BossStatus = "Boss defeated"
+        notify("Boss", "Boss defeated; returning to farm", "success", 5)
+    elseif not Enchant.bossWanted() then
+        Runtime.BossStatus = "Auto boss stopped"
+    else
+        Runtime.BossStatus = "Boss ended"
+    end
+    if alive() then
+        pcall(function() hum:UnequipTools() end)
+        if savedCFrame then
+            char:PivotTo(savedCFrame)
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+        end
+    end
+    Runtime.BossBusy = false
+    Runtime.ActiveSourceKind = nil
+    if State.FarmMode ~= "Off" then
+        startFarm()
+    elseif State.AlwaysKingsGym and not insideKingsGym() then
+        spawnTask(teleportToKingsGym)
+    else
+        Runtime.Status = Runtime.BossStatus
+        Runtime.Target = "none"
+    end
+    return countedKill
+end
+
+spawnTask(function()
+    while running() do
+        elevate()
+        if Enchant.bossWanted() and not Runtime.BossBusy then
+            local boss = Boss.findActive()
+            if boss then
+                local ok, err = pcall(Boss.kill, boss)
+                if not ok then
+                    Runtime.BossBusy = false
+                    Runtime.BossStatus = "Boss error: " .. tostring(err)
+                    Runtime.Status = Runtime.BossStatus
+                end
+            else
+                Runtime.BossStatus = "Waiting for boss"
+            end
+        end
+        task.wait(Runtime.BossBusy and 0.1 or 0.5)
+    end
+end)
 
 spawnTask(function()
     while running() do
@@ -1495,7 +1886,6 @@ local function nextNpcQuest(questLine)
     local catalogQuests = questLine and questLine:FindFirstChild("Quests")
     if not root or not story or not completed or not catalogQuests then return nil end
 
-    -- An NPC only gives another story quest after its current one is collected.
     if story:FindFirstChild(questLine.Name) then return nil end
 
     local finished = completed:FindFirstChild(questLine.Name)
@@ -1514,7 +1904,6 @@ local function nextNpcQuest(questLine)
         end
     end
 
-    -- Industrial Gains unlocks one rotating quest every 24 hours.
     if questLine.Name == "Industrial Gains" then
         local industrial = root:FindFirstChild("Industrial Daily")
         if industrial and #industrial:GetChildren() > 0 then return nil end
@@ -1652,6 +2041,75 @@ local function equippedSet()
         if ref and ref.Value then set[ref.Value] = true end
     end
     return set, slots
+end
+
+function Enchant.tryEvolve(quest)
+    if Runtime.EnchantEvolveQuest ~= quest then
+        Runtime.EnchantEvolveQuest = quest
+        Runtime.EnchantEvolveSpent = 0
+        Runtime.EnchantEvolveAction = "preparing Basic pets"
+    end
+    if not Enchant.wantsEvolve() or os.clock() < Runtime.EnchantEvolveNextTry then return end
+    Runtime.EnchantEvolveNextTry = os.clock() + 1
+
+    local blue = sharedFolder.catalogs.crystalChances:FindFirstChild("Blue Crystal")
+    local pets = LocalPlayer:FindFirstChild("petsFolder")
+    if not blue or not pets then
+        Runtime.EnchantEvolveAction = "Blue Crystal or pet inventory missing"
+        return
+    end
+    local allowed = {}
+    for _, entry in ipairs(blue:GetChildren()) do
+        if entry:GetAttribute("ItemKind") == "Pet" and entry:GetAttribute("Rarity") == "Basic" then
+            local name = entry:GetAttribute("ItemName")
+            if type(name) == "string" and not PERK_PETS[name] then allowed[name] = true end
+        end
+    end
+
+    local equipped = equippedSet()
+    local counts, protected = {}, {}
+    local basic = pets:FindFirstChild("Basic")
+    if basic then
+        for _, pet in ipairs(basic:GetChildren()) do
+            if pet:IsA("StringValue") and allowed[pet.Name] and not pet:FindFirstChild("evolved") then
+                counts[pet.Name] = (counts[pet.Name] or 0) + 1
+                if equipped[pet] or pet:GetAttribute("Locked") == true
+                    or pet:GetAttribute("TradeLocked") == true or pet:FindFirstChild("unsellable") then
+                    protected[pet.Name] = true
+                end
+            end
+        end
+    end
+    local readyName, readyCount
+    for name, count in pairs(counts) do
+        if count >= 5 and not protected[name] and (not readyCount or count > readyCount) then
+            readyName, readyCount = name, count
+        end
+    end
+    if readyName then
+        fire(Remotes.PetEvolve, "evolvePet", readyName)
+        Runtime.EnchantEvolveNextTry = os.clock() + 2
+        Runtime.EnchantEvolveAction = "evolving " .. readyName
+        return
+    end
+
+    if Runtime.EnchantEvolveSpent >= Enchant.EvolveSpendLimit then
+        Runtime.EnchantEvolveAction = "300,000 Gem quest cap reached"
+        return
+    end
+    local price, kind = crystalCost("Blue Crystal")
+    if not price or kind ~= "Gems" or Runtime.EnchantEvolveSpent + price > Enchant.EvolveSpendLimit then
+        Runtime.EnchantEvolveAction = "Blue Crystal unavailable or quest cap reached"
+        return
+    end
+    local ok, reason = hatchOnce("Blue Crystal")
+    Runtime.EnchantEvolveNextTry = os.clock() + (ok and 0.5 or 3)
+    if ok then
+        Runtime.EnchantEvolveSpent = Runtime.EnchantEvolveSpent + price
+        Runtime.EnchantEvolveAction = ("hatching Basic pets (%s Gems spent)"):format(short(Runtime.EnchantEvolveSpent))
+    else
+        Runtime.EnchantEvolveAction = "hatch paused: " .. tostring(reason)
+    end
 end
 
 local function equipBestPets()
@@ -1804,8 +2262,6 @@ local function fuseSelectedPets()
     local selected = State.FusePetNames
     if type(selected) ~= "table" then return 0 end
 
-    -- The craft machine has one server-side timed slot. Query/claim that slot
-    -- with empty inputs; the four input instances only belong to craftPets.
     local current = invoke(Remotes.PetCraft, "getFuse", EMPTY_FUSE_SLOTS)
     if type(current) ~= "table" then
         Runtime.FuseStatus = "Could not read fuse state"
@@ -1860,8 +2316,6 @@ local function fuseSelectedPets()
     end)
 end
 
--- Kept for callers of the older session API; this now performs the actual
--- four-pet fusion flow instead of the unrelated five-copy evolve event.
 local function evolveReadyPets(selection)
     local previous = State.FusePetNames
     State.FusePetNames = selection or previous
@@ -1888,18 +2342,18 @@ spawnTask(function()
     local nextPets = 0
     while running() do
         elevate()
-        if State.AutoHatch then
+        if State.AutoHatch and not Runtime.BossBusy and not Enchant.wantsEvolve() then
             local ok = hatchOnce(State.HatchCrystal)
             task.wait(ok and State.HatchDelay or 3)
         else
             task.wait(1)
         end
-        if (State.AutoEquipPets or State.AutoSellPets or State.AutoDeletePets or State.AutoFusePets) and os.clock() > nextPets then
+        if not Runtime.BossBusy and (State.AutoEquipPets or State.AutoSellPets or State.AutoDeletePets or State.AutoFusePets) and os.clock() > nextPets then
             nextPets = os.clock() + 15
-            if State.AutoSellPets then pcall(sellJunkPets) end
-            if State.AutoDeletePets then pcall(deleteSelectedPets) end
+            if State.AutoSellPets and not Enchant.wantsEvolve() then pcall(sellJunkPets) end
+            if State.AutoDeletePets and not Enchant.wantsEvolve() then pcall(deleteSelectedPets) end
             if State.AutoFusePets then pcall(fuseSelectedPets) end
-            if State.AutoEquipPets then pcall(equipBestPets) end
+            if State.AutoEquipPets and not Enchant.wantsEvolve() then pcall(equipBestPets) end
         end
     end
 end)
@@ -1932,6 +2386,8 @@ if RELOAD_STATE and RELOAD_STATE.onCleanup then
     RELOAD_STATE.onCleanup(function()
         State.Running = false
         State.FarmMode = "Off"
+        State.AutoKillBoss = false
+        Runtime.BossToken = Runtime.BossToken + 1
         Runtime.FarmToken = Runtime.FarmToken + 1
         for _, gui in ipairs(game.CoreGui:GetChildren()) do
             if gui.Name == "GuiLibraryUI" or gui.Name == "NotificationGui" then
@@ -2068,6 +2524,7 @@ local farmModeDropdown = GuiLibrary:CreateDropdown(FarmTab, "Choose Stat To Farm
         startFarm()
         notify("Auto Farm", "Mode set to " .. v, "info")
     end
+    if updateSourceControls then updateSourceControls() end
 end)
 
 local sourceMethodDropdown = GuiLibrary:CreateDropdown(FarmTab, "Farm Method", {"Auto (Fastest)", "Machines", "Tools"}, function(v)
@@ -2098,7 +2555,7 @@ updateSourceControls = function()
         machineDropdown.Frame.Visible = State.FarmMethod == "Machines"
     end
     if toolDropdown and toolDropdown.Frame then
-        toolDropdown.Frame.Visible = State.FarmMethod == "Tools"
+        toolDropdown.Frame.Visible = State.FarmMethod == "Tools" and State.FarmMode ~= "Strength"
     end
 end
 updateSourceControls()
@@ -2130,6 +2587,20 @@ if State.FarmMode ~= "Off" then setFarmMode("Off") end
 
 GuiLibrary:CreateLabel(FarmTab, "Rotate automatically switches between Strength, Agility, and Durability.")
 GuiLibrary:CreateLabel(FarmTab, "Machine and tool selectors only appear for their matching farm method.")
+GuiLibrary:CreateLabel(FarmTab, "Strength + Tools always uses the normal dumbbell (Weight, hotbar slot 2).")
+
+GuiLibrary:CreateSection(FarmTab, "Boss")
+local bossStatusLabel = GuiLibrary:CreateLabel(FarmTab, "Boss: Waiting for boss")
+GuiLibrary:CreateToggle(FarmTab, "Auto Kill Boss", false, function(v)
+    State.AutoKillBoss = v
+    if not v then
+        Runtime.BossToken = Runtime.BossToken + 1
+        Runtime.BossStatus = "Auto boss stopped"
+    else
+        Runtime.BossStatus = Boss.findActive() and "Boss found" or "Waiting for boss"
+    end
+    notify("Boss", v and "Auto Kill Boss enabled" or "Auto Kill Boss disabled", v and "success" or "warning")
+end)
 
 GuiLibrary:CreateSection(FarmTab, "Automatic Rebirth")
 
@@ -2174,10 +2645,22 @@ GuiLibrary:CreateToggle(CollectTab, "Auto Chests (6h timers)", false, function(v
 GuiLibrary:CreateToggle(CollectTab, "Auto Group Rewards", false, function(v) State.AutoGroup = v end)
 GuiLibrary:CreateToggle(CollectTab, "Auto Free Gifts (playtime)", false, function(v) State.AutoGifts = v end)
 GuiLibrary:CreateToggle(CollectTab, "Auto Fortune Wheel (free spins)", false, function(v) State.AutoWheel = v end)
-GuiLibrary:CreateToggle(CollectTab, "Auto Get & Collect NPC Quests", false, function(v)
+GuiLibrary:CreateToggle(CollectTab, "Auto Get & Collect NPC Quests", State.AutoQuests, function(v)
     State.AutoQuests = v
     if v then spawnTask(updateNpcQuests) end
 end)
+
+GuiLibrary:CreateSection(CollectTab, "Pet Enchant Quest")
+Runtime.EnchantQuestLabel = GuiLibrary:CreateLabel(CollectTab, "Enchant quest: waiting")
+Runtime.EnchantQuestToggle = GuiLibrary:CreateToggle(CollectTab, "Auto Complete Enchant Quest", State.AutoEnchantQuest, function(v)
+    State.AutoEnchantQuest = v
+    Runtime.EnchantQuestStatus = v and "Checking current quest" or "Stopped"
+    if not v then Runtime.BossToken = Runtime.BossToken + 1 end
+end)
+Runtime.EnchantEvolveToggle = GuiLibrary:CreateToggle(CollectTab, "Use Basic Pets For Evolve Quests", State.EnchantEvolvePets, function(v)
+    State.EnchantEvolvePets = v
+end)
+GuiLibrary:CreateLabel(CollectTab, "Five objectives are automatic. For Evolves, opt in to Blue Crystal hatching and unequipped Basic pet evolution (300,000 Gem cap per quest).")
 
 GuiLibrary:CreateSection(CollectTab, "Manual")
 
@@ -2253,19 +2736,25 @@ GuiLibrary:CreateButton(PetsTab, "Delete Selected Pets Now", function()
     end)
 end)
 
-GuiLibrary:CreateSection(PetsTab, "Pet Fusion")
-GuiLibrary:CreateLabel(PetsTab, "Each fuse uses 4 matching copies. Evolved and normal copies share one name entry but are batched separately.")
-local fuseStatusLabel = GuiLibrary:CreateLabel(PetsTab, "Fuse status: " .. Runtime.FuseStatus)
-local petFuseDropdown = GuiLibrary:CreateMultiSelect(PetsTab, "Pets To Auto Fuse", currentPetNames, {}, function(sel)
-    State.FusePetNames = sel or {}
-end)
-GuiLibrary:CreateToggle(PetsTab, "Auto Fuse Selected Pets", false, function(v) State.AutoFusePets = v end)
-GuiLibrary:CreateButton(PetsTab, "Fuse Selected Ready Pets Now", function()
-    spawnTask(function()
-        local n = fuseSelectedPets()
-        notify("Pet Fusion", n > 0 and Runtime.FuseStatus or ("No action: " .. Runtime.FuseStatus), n > 0 and "success" or "warning")
+local fuseStatusLabel, petFuseDropdown
+if workspace:FindFirstChild("PetMachine") then
+    GuiLibrary:CreateSection(PetsTab, "Pet Fusion")
+    GuiLibrary:CreateLabel(PetsTab, "Each fuse uses 4 matching copies. Evolved and normal copies are batched separately.")
+    fuseStatusLabel = GuiLibrary:CreateLabel(PetsTab, "Fuse status: " .. Runtime.FuseStatus)
+    petFuseDropdown = GuiLibrary:CreateMultiSelect(PetsTab, "Pets To Auto Fuse", currentPetNames, {}, function(sel)
+        State.FusePetNames = sel or {}
     end)
-end)
+    GuiLibrary:CreateToggle(PetsTab, "Auto Fuse Selected Pets", false, function(v) State.AutoFusePets = v end)
+    GuiLibrary:CreateButton(PetsTab, "Fuse Selected Ready Pets Now", function()
+        spawnTask(function()
+            local n = fuseSelectedPets()
+            notify("Pet Fusion", n > 0 and Runtime.FuseStatus or ("No action: " .. Runtime.FuseStatus), n > 0 and "success" or "warning")
+        end)
+    end)
+else
+    GuiLibrary:CreateSection(PetsTab, "Pet Enchanting")
+    GuiLibrary:CreateLabel(PetsTab, "The fusion machine is absent in this update. Enchant quest automation is in Collect.")
+end
 
 spawnTask(function()
     local lastSignature = ""
@@ -2285,8 +2774,10 @@ spawnTask(function()
             for _, name in ipairs(names) do
                 if name ~= "No pets found" and State.FusePetNames[name] then valid[name] = true end
             end
-            petFuseDropdown.UpdateOptions(names, true)
-            petFuseDropdown.SetValue(valid)
+            if petFuseDropdown then
+                petFuseDropdown.UpdateOptions(names, true)
+                petFuseDropdown.SetValue(valid)
+            end
         end
         if fuseStatusLabel then fuseStatusLabel.SetText("Fuse status: " .. Runtime.FuseStatus) end
         task.wait(2)
@@ -2315,6 +2806,7 @@ local sSession = GuiLibrary:CreateLabel(StatsTab, "Session: -")
 GuiLibrary:CreateButton(StatsTab, "Reset Session Counters", function()
     Runtime.Reps, Runtime.Hatched, Runtime.Claimed = 0, 0, 0
     Runtime.RebirthCount, Runtime.Boosts, Runtime.Upgrades, Runtime.Evolved = 0, 0, 0, 0
+    Runtime.BossDamage, Runtime.BossKills = 0, 0
     Runtime.StartClock = os.clock()
     Runtime.StartStats = {Strength = Strength.Value, Agility = Agility.Value, Durability = Durability.Value}
 end)
@@ -2358,10 +2850,149 @@ GuiLibrary:CreateSection(MiscTab, "Session Control")
 GuiLibrary:CreateButton(MiscTab, "Stop Everything", function()
     State.AutoHatch, State.AutoBoosts, State.AutoUltimates = false, false, false
     State.AutoChests, State.AutoGroup, State.AutoGifts, State.AutoWheel, State.AutoQuests = false, false, false, false, false
+    State.AutoEnchantQuest = false
+    Runtime.EnchantDiscardFarm = true
     State.AutoEquipPets, State.AutoSellPets, State.AutoDeletePets = false, false, false
-    State.AutoFusePets, State.AutoRebirth, State.AlwaysKingsGym = false, false, false
+    State.AutoFusePets, State.AutoRebirth, State.AlwaysKingsGym, State.AutoKillBoss = false, false, false, false
+    Runtime.BossToken = Runtime.BossToken + 1
     setFarmMode("Off")
     notify("Auto Farm", "All automation stopped", "warning")
+end)
+
+function Enchant.restoreFarm()
+    if not Runtime.EnchantFarmSaved then return end
+    local saved = Runtime.EnchantFarmSaved
+    Runtime.EnchantFarmSaved = nil
+    if Runtime.EnchantDiscardFarm then
+        Runtime.EnchantDiscardFarm = false
+        return
+    end
+    State.FarmMethod = saved.method
+    State.StrengthSource = saved.method
+    State.SourcePreference = saved.method
+    State.SelectedMachine = saved.machine
+    State.FarmMode = saved.mode
+    pcall(sourceMethodDropdown.SetValue, saved.method)
+    pcall(machineDropdown.SetValue, saved.machine)
+    pcall(farmModeDropdown.SetValue, saved.mode)
+    updateSourceControls()
+    if saved.mode == "Off" then stopFarm("Idle") else startFarm() end
+end
+
+function Enchant.setFarm(mode, method)
+    if not Runtime.EnchantFarmSaved then
+        Runtime.EnchantFarmSaved = {
+            mode = State.FarmMode,
+            method = State.FarmMethod,
+            machine = State.SelectedMachine,
+        }
+    end
+    if State.FarmMode == mode and State.FarmMethod == method
+        and (method ~= "Machines" or State.SelectedMachine == "Auto (Best)") then return end
+    State.FarmMethod = method
+    State.StrengthSource = method
+    State.SourcePreference = method
+    State.SelectedMachine = "Auto (Best)"
+    State.FarmMode = mode
+    Runtime.Rates = {}
+    Runtime.Blacklist = {}
+    pcall(sourceMethodDropdown.SetValue, method)
+    pcall(machineDropdown.SetValue, "Auto (Best)")
+    pcall(farmModeDropdown.SetValue, mode)
+    updateSourceControls()
+    startFarm()
+end
+
+spawnTask(function()
+    local brawl = sharedFolder:WaitForChild("state"):WaitForChild("Brawl")
+    local brawlController
+    local lastClaim = 0
+    while running() do
+        elevate()
+        if not State.AutoEnchantQuest then
+            Enchant.restoreFarm()
+            Runtime.EnchantQuestStatus = "Stopped"
+            Runtime.EnchantBrawlJoined = false
+        else
+            local quest, objective, progress, goal = Enchant.objective()
+            if not quest then
+                Enchant.restoreFarm()
+                Runtime.EnchantQuestStatus = "All available enchant quests completed; waiting for reset"
+            elseif goal <= 0 then
+                Enchant.restoreFarm()
+                Runtime.EnchantQuestStatus = quest.Name .. ": invalid objective"
+            elseif progress >= goal then
+                Enchant.restoreFarm()
+                Runtime.EnchantQuestStatus = quest.Name .. ": claiming reward"
+                if os.clock() - lastClaim >= 2 and gf("checkForCompleteQuest", quest) == true then
+                    lastClaim = os.clock()
+                    fire(Remotes.Quests, "collectQuest", quest)
+                end
+            else
+                Runtime.EnchantQuestStatus = ("%s: %s %s/%s"):format(
+                    quest.Name, objective, short(progress), short(goal))
+                if objective == "Brawls Joined" then
+                    Enchant.restoreFarm()
+                    local active = brawl:GetAttribute("BrawlInProgress") == true
+                    local started = brawl:GetAttribute("BrawlStarted") == true
+                    if not active then
+                        Runtime.EnchantBrawlJoined = false
+                        Runtime.EnchantBrawlLastTry = 0
+                        Runtime.EnchantBrawlProgressAtTry = progress
+                    elseif not started then
+                        if Runtime.EnchantBrawlLastTry > 0
+                            and progress > Runtime.EnchantBrawlProgressAtTry then
+                            Runtime.EnchantBrawlJoined = true
+                        end
+                        if not Runtime.EnchantBrawlJoined
+                            and os.clock() - Runtime.EnchantBrawlLastTry >= 3 then
+                            Runtime.EnchantBrawlLastTry = os.clock()
+                            Runtime.EnchantBrawlProgressAtTry = progress
+                            if not brawlController then
+                                local ok, controller = pcall(require,
+                                    ReplicatedStorage.client.controllers.BrawlController)
+                                elevate()
+                                if ok then brawlController = controller end
+                            end
+                            if brawlController then
+                                pcall(function() brawlController:AcceptBrawl() end)
+                                elevate()
+                            end
+                        end
+                    end
+                elseif objective == "Machine Reps" then
+                    Enchant.setFarm("Strength", "Machines")
+                elseif objective == "Agility" or objective == "Durability" then
+                    Enchant.setFarm(objective, "Auto (Fastest)")
+                elseif objective == "Evolves" then
+                    Enchant.restoreFarm()
+                    if State.EnchantEvolvePets then
+                        local ok, err = pcall(Enchant.tryEvolve, quest)
+                        if not ok then
+                            Runtime.EnchantEvolveAction = "error: " .. tostring(err)
+                            Runtime.EnchantEvolveNextTry = os.clock() + 3
+                        end
+                        Runtime.EnchantQuestStatus = Runtime.EnchantQuestStatus
+                            .. " | " .. Runtime.EnchantEvolveAction
+                    else
+                        Runtime.EnchantQuestStatus = Runtime.EnchantQuestStatus
+                            .. " | Basic pet evolution disabled"
+                    end
+                else
+                    Enchant.restoreFarm()
+                    if objective ~= "Bosses Defeated" then
+                        Runtime.EnchantQuestStatus = Runtime.EnchantQuestStatus
+                            .. " | unsupported objective"
+                    end
+                end
+            end
+        end
+        if Runtime.EnchantQuestLabel then
+            Runtime.EnchantQuestLabel.SetText("Enchant quest: " .. Runtime.EnchantQuestStatus)
+        end
+        task.wait(State.AutoEnchantQuest and 0.25 or 0.75)
+    end
+    Enchant.restoreFarm()
 end)
 
 spawnTask(function()
@@ -2374,6 +3005,7 @@ spawnTask(function()
         local perMin = 60 / elapsed
         if statusLabel then statusLabel.SetText("Status: " .. Runtime.Status) end
         if targetLabel then targetLabel.SetText("Target: " .. Runtime.Target) end
+        if bossStatusLabel then bossStatusLabel.SetText("Boss: " .. Runtime.BossStatus) end
         if benchLabel then benchLabel.SetText("Benchmark: " .. Runtime.Bench) end
         if rebirthLabel then
             rebirthLabel.SetText(("Next rebirth at: %s strength (have %s)"):format(short(rebirthTarget()), short(Strength.Value)))
@@ -2413,9 +3045,9 @@ spawnTask(function()
         end
         if sSession then
             local landed = repsProgress and (repsProgress.Value - repsStart) or 0
-            sSession.SetText(("Reps landed: %d (%.1f/s)   Sent: %d   Hatched: %d   Fused: %d   Claims: %d   Boosts: %d   Ults: %d   Rebirths: %d")
+            sSession.SetText(("Reps landed: %d (%.1f/s)   Sent: %d   Hatched: %d   Fused: %d   Claims: %d   Boosts: %d   Ults: %d   Rebirths: %d   Bosses: %d")
                 :format(landed, landed / elapsed, Runtime.Reps, Runtime.Hatched, Runtime.Evolved,
-                        Runtime.Claimed, Runtime.Boosts, Runtime.Upgrades, Runtime.RebirthCount))
+                        Runtime.Claimed, Runtime.Boosts, Runtime.Upgrades, Runtime.RebirthCount, Runtime.BossKills))
         end
         task.wait(0.5)
     end
@@ -2430,7 +3062,8 @@ SESSION.api = {
     generation = MY_GENERATION,
     generationAlive = generationAlive,
     ui = {farmMode = farmModeDropdown, farmMethod = sourceMethodDropdown, farmAreas = farmAreaDropdown,
-        machine = machineDropdown, tool = toolDropdown, fusePets = petFuseDropdown},
+        machine = machineDropdown, tool = toolDropdown, fusePets = petFuseDropdown,
+        enchantQuest = Runtime.EnchantQuestToggle, enchantEvolve = Runtime.EnchantEvolveToggle},
     candidateSources = candidateSources,
     teleportToKingsGym = teleportToKingsGym,
     machineSources = machineSources,
@@ -2446,6 +3079,8 @@ SESSION.api = {
     deleteSelectedPets = deleteSelectedPets,
     evolveReadyPets = evolveReadyPets,
     fuseSelectedPets = fuseSelectedPets,
+    findActiveBoss = Boss.findActive,
+    killBoss = Boss.kill,
     travelToArea = travelToArea,
     hatchOnce = hatchOnce,
     rebirthChain = rebirthChain,
