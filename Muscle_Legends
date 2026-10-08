@@ -47,6 +47,8 @@ local Agility = LocalPlayer:WaitForChild("Agility")
 local Durability = LocalPlayer:WaitForChild("Durability")
 local Gems = LocalPlayer:WaitForChild("Gems")
 local Tokens = LocalPlayer:WaitForChild("Tokens")
+local OverchargedShards = LocalPlayer:WaitForChild("OverchargedShards")
+local currentMap = LocalPlayer:WaitForChild("currentMap")
 
 local Remotes = {
     Machine   = rEvents:WaitForChild("machineInteractRemote"),
@@ -64,6 +66,7 @@ local Remotes = {
     Area      = rEvents:WaitForChild("areaTravelRemote"),
     Rejoin    = rEvents:WaitForChild("rejoinServerEvent"),
     Ultimates = rEvents:WaitForChild("ultimatesRemote"),
+    OverchargedShop = rEvents:FindFirstChild("overchargedShopRemote"),
 }
 
 local machinesFolder = workspace:WaitForChild("machinesFolder")
@@ -97,6 +100,7 @@ do
         ["Jungle Gym"] = {"jungle", "ancient"},
         ["Industrial Gym"] = {"industrial"},
         ["Muscle King Gym"] = {"muscleking", "kinggym", "king"},
+        ["Overcharged Gym"] = {"overcharged", "overcharge"},
     }
     local byId = {}
     for _, circle in ipairs(areaCircles:GetChildren()) do
@@ -195,6 +199,8 @@ local State = {
     AutoGroup = false,
     AutoGifts = false,
     AutoWheel = false,
+    AutoBuyOverchargedShop = SESSION.State and SESSION.State.AutoBuyOverchargedShop == true or false,
+    OverchargedShopItems = SESSION.State and SESSION.State.OverchargedShopItems or {},
     AutoQuests = SESSION.State and SESSION.State.AutoQuests == true or false,
     AutoEnchantQuest = SESSION.State and SESSION.State.AutoEnchantQuest == true or false,
     EnchantEvolvePets = SESSION.State and SESSION.State.EnchantEvolvePets == true or false,
@@ -223,6 +229,9 @@ local Runtime = {
     FarmToken = 0,
     Reps = 0,
     Hatched = 0,
+    ShopBought = 0,
+    ShopStatus = "Waiting",
+    ShopFailures = {},
     Claimed = 0,
     Boosts = 0,
     Upgrades = 0,
@@ -242,6 +251,8 @@ local Runtime = {
     RebirthRepRequests = 0,
     FastRebirthAttempts = 0,
     FastRebirthRejects = 0,
+    LastRebirthSuccessAt = 0,
+    LastRebirthNoticeAt = 0,
     RebirthBusy = false,
     RebirthReturnArea = nil,
     RebirthReturnMachine = nil,
@@ -270,6 +281,7 @@ local Runtime = {
     Blacklist = {},
 }
 local Enchant = {}
+Enchant.Shop = {AllItems = "All Items"}
 Enchant.EvolveSpendLimit = 300000
 
 local char, hum, hrp
@@ -616,6 +628,9 @@ local function areaForInstance(inst)
         end
         if matches == 1 then return matched end
     end
+    -- Destination pads live inside their actual farm regions. Only accept a
+    -- spatial match within that region; choosing the globally nearest pad made
+    -- unrelated/hidden machines look like Beach machines.
     local position = instancePosition(inst)
     local nearest, nearestDistance
     if position then
@@ -766,6 +781,40 @@ local function insideRecordedArea(area)
         and (hrp.Position - Runtime.AreaAnchor.Position).Magnitude <= 1000
 end
 
+local areaControllerCache
+local function travelToOvercharged(area)
+    if not alive() or not area or not area.circle then return false end
+    if currentMap.Value == area.id then return true end
+    local trigger = area.circle:FindFirstChild("circleInner")
+    if not trigger or not trigger:IsA("BasePart") then return false end
+    if not areaControllerCache then
+        local ok, controller = pcall(require, ReplicatedStorage.client.controllers.AreaController)
+        elevate()
+        if ok then areaControllerCache = controller end
+    end
+    if not areaControllerCache then return false end
+
+    -- The updated server rejects a bare travelToArea invocation for this gym.
+    -- Replicate standing inside its circle so AreaController selects the circle,
+    -- then use the same confirmation path as the game's Travel button.
+    local settleUntil = os.clock() + 0.4
+    while running() and alive() and os.clock() < settleUntil do
+        anchorAt(trigger.CFrame)
+        beat()
+        task.wait(0.03)
+    end
+    pcall(areaControllerCache.HandleAreaEntered, areaControllerCache, area.circle)
+    elevate()
+    pcall(areaControllerCache.ConfirmTravel, areaControllerCache)
+    elevate()
+    local deadline = os.clock() + 8
+    while running() and alive() and currentMap.Value ~= area.id and os.clock() < deadline do
+        beat()
+        task.wait(0.05)
+    end
+    return currentMap.Value == area.id
+end
+
 travelToArea = function(area, instant)
     if not area or not alive() then return false end
     if insideRecordedArea(area) then
@@ -793,7 +842,9 @@ travelToArea = function(area, instant)
             end
         end
     end
-    if travelCircle and not instant then
+    if area.id == "Overcharged Gym" and travelCircle then
+        arrived = travelToOvercharged(area)
+    elseif travelCircle and not instant then
         invoke(Remotes.Area, "travelToArea", travelCircle)
         local deadline = os.clock() + 2
         while running() and os.clock() < deadline do
@@ -878,6 +929,11 @@ local function engageMachine(source)
         task.wait(0.1)
         return false
     end
+    -- The server validates the player's replicated position. Calling useMachine
+    -- immediately after PivotTo races that replication and returns false/nil even
+    -- though pressing E works. Stay on the same target long enough for the server
+    -- to see us, and retry that target instead of blacklisting it and teleporting
+    -- around the area.
     local lastReason
     for attempt = 1, 3 do
         if not alive() or not source.seat.Parent then return false end
@@ -1026,6 +1082,8 @@ end
 local function pickSource(gainKey, token)
     local list = candidateSources(gainKey)
     if #list == 0 then return nil end
+    -- Strength sources all use the same player multipliers, so gain / repTime
+    -- ranks them exactly without a long benchmark after every rebirth.
     if State.AutoBenchmark and gainKey ~= "strengthGain" then
         local full = os.clock() - Runtime.RatesStamp > State.BenchmarkEvery
         if full then Runtime.Rates = {} end
@@ -1186,7 +1244,11 @@ local function doRebirth()
     local res = invoke(Remotes.Rebirth, "rebirthRequest")
     if res == true then
         Runtime.RebirthCount = Runtime.RebirthCount + 1
-        notify("Rebirth", "Rebirth " .. tostring(Rebirths.Value) .. " complete", "success")
+        Runtime.LastRebirthSuccessAt = os.clock()
+        if os.clock() - Runtime.LastRebirthNoticeAt >= 60 then
+            Runtime.LastRebirthNoticeAt = os.clock()
+            notify("Rebirth", "Auto rebirth is running (now " .. tostring(Rebirths.Value) .. ")", "success")
+        end
     end
     if res ~= true then
         Runtime.RebirthReturnArea = nil
@@ -1208,13 +1270,20 @@ local function doRebirth()
     return res == true
 end
 
+local function fastStrengthToolFarm()
+    if State.FarmMode ~= "Strength" or Runtime.BossBusy or isMounted() then return false end
+    if State.FarmMethod == "Tools" then return true end
+    if State.FarmMethod == "Machines" then return false end
+    local held = heldToolInstance()
+    return Runtime.ActiveSourceKind == "tool" or (held ~= nil and held.Name == "Weight")
+end
+
 local function rebirthChain(maxCount, spendBoosts, fastTools)
     maxCount = maxCount or 50
     if fastTools then
         local gained, nextAttempt = 0, 0
         local targetRebirths, target = nil, math.huge
-        while running() and State.AutoRebirth and State.FarmMode == "Strength"
-            and State.FarmMethod == "Tools" and not Runtime.BossBusy and gained < maxCount do
+        while running() and State.AutoRebirth and fastStrengthToolFarm() and gained < maxCount do
             beat()
             if Rebirths.Value ~= targetRebirths then
                 targetRebirths = Rebirths.Value
@@ -1236,9 +1305,13 @@ local function rebirthChain(maxCount, spendBoosts, fastTools)
                 if res == true then
                     gained = gained + 1
                     Runtime.RebirthCount = Runtime.RebirthCount + 1
+                    Runtime.LastRebirthSuccessAt = os.clock()
                     Runtime.RebirthRecoveryUntil = os.clock() + 12
                     Runtime.Status = "Rebirthing (" .. gained .. ")"
-                    notify("Rebirth", "Rebirth " .. tostring(Rebirths.Value) .. " complete", "success")
+                    if os.clock() - Runtime.LastRebirthNoticeAt >= 60 then
+                        Runtime.LastRebirthNoticeAt = os.clock()
+                        notify("Rebirth", "Auto rebirth is running (now " .. tostring(Rebirths.Value) .. ")", "success")
+                    end
                     if State.AutoUltimates then pcall(upgradeUltimates) end
                     nextAttempt = os.clock() + 0.05
                 else
@@ -1246,7 +1319,9 @@ local function rebirthChain(maxCount, spendBoosts, fastTools)
                     Runtime.RebirthReturnMachine = previousMachine
                     Runtime.FastRebirthRejects = Runtime.FastRebirthRejects + 1
                     Runtime.Status = "Rebirth ready; waiting for server"
-                    nextAttempt = os.clock() + 0.1
+                    local earliest = Runtime.LastRebirthSuccessAt + 5.5
+                    nextAttempt = Runtime.LastRebirthSuccessAt > 0 and os.clock() < earliest
+                        and earliest or (os.clock() + 0.1)
                 end
             end
             task.wait(0.03)
@@ -1276,13 +1351,13 @@ local function rebirthChain(maxCount, spendBoosts, fastTools)
 end
 
 local function requestAutoRebirth()
-    local fastTools = State.FarmMode == "Strength" and State.FarmMethod == "Tools"
+    local fastTools = fastStrengthToolFarm()
     if not running() or not State.AutoRebirth or Runtime.RebirthBusy or Runtime.BossBusy
         or not canRebirth(fastTools) then return false end
     Runtime.RebirthBusy = true
     Runtime.FarmToken = Runtime.FarmToken + 1
     spawnTask(function()
-        local gained = rebirthChain(50, false, fastTools)
+        local gained = rebirthChain(fastTools and math.huge or 50, false, fastTools)
         Runtime.RebirthBusy = false
         if State.FarmMode ~= "Off" and restartFarm then restartFarm() end
     end)
@@ -1293,11 +1368,13 @@ Strength.Changed:Connect(function()
     if running() and State.AutoRebirth then requestAutoRebirth() end
 end)
 
+-- Keep the normal dumbbell rep stream alive while the regular farm loop is
+-- paused for auto-rebirth. The game may reject reps during its rebirth lock,
+-- but this lets the first eligible rep through without waiting for farm setup.
 spawnTask(function()
     local lastEquipTry = 0
     while running() do
-        if Runtime.RebirthBusy and State.FarmMode == "Strength" and State.FarmMethod == "Tools"
-            and not Runtime.BossBusy and alive() and not isMounted() then
+        if Runtime.RebirthBusy and fastStrengthToolFarm() and alive() then
             local held = heldToolInstance()
             if held and held.Name == "Weight" then
                 local ok = pcall(muscleEvent.FireServer, muscleEvent, "rep")
@@ -1617,12 +1694,16 @@ function Boss.dodgeCFrame(arena, attackCFrame)
     local attackPosition = attackCFrame.Position
     local away = Vector3.new(center.X - attackPosition.X, 0, center.Z - attackPosition.Z)
     if away.Magnitude < 1 then away = Vector3.new(1, 0, 0) end
+    -- The arena accepts players within 300 studs of its center. A 235-stud
+    -- radius stays inside while clearing the largest 187.5-stud boss attack.
     local floorY = spawn and spawn.Position.Y + Boss.standHeight() + 2 or center.Y + Boss.standHeight()
     local safePosition = Vector3.new(center.X, floorY, center.Z) + away.Unit * 235
     return CFrame.lookAt(safePosition, Vector3.new(attackPosition.X, floorY, attackPosition.Z))
 end
 
 function Boss.footCFrame(boss, arena, hitbox)
+    -- Boss avatars are a single animated MeshPart named Boss, so derive the
+    -- foot from that mesh's live local bounds instead of the oversized hitbox.
     local body = boss:FindFirstChild("Boss")
     if body and body:IsA("BasePart") then
         local foot = body.CFrame:PointToWorldSpace(Vector3.new(-body.Size.X * 0.22, -body.Size.Y / 2 + 8, 0))
@@ -1717,12 +1798,17 @@ function Boss.kill(boss)
                         nextEquip = os.clock() + 0.5
                         pcall(function() hum:EquipTool(punch) end)
                     end
+                    -- Boss hits are server-validated physical overlaps. Keep the
+                    -- character unanchored and inside the moving damage hitbox;
+                    -- anchoring makes Punch requests arrive but deal no damage.
                     pcall(function() hrp.Anchored = false end)
                     local impactTime = tonumber(boss:GetAttribute("BossAttackImpactTime"))
                     local attackCFrame = boss:GetAttribute("BossAttackCFrame")
                     local untilImpact = impactTime and (impactTime - workspace:GetServerTimeNow()) or math.huge
                     local dodging = typeof(attackCFrame) == "CFrame" and untilImpact <= 1.1 and untilImpact >= -0.35
                     if dodging then
+                        -- The server publishes the attack location and exact impact
+                        -- time. Move across the arena only for that short window.
                         char:PivotTo(Boss.dodgeCFrame(arena, attackCFrame))
                         nextTrack = 0
                         engageReadyAt = os.clock() + 0.25
@@ -1730,8 +1816,13 @@ function Boss.kill(boss)
                         Runtime.BossStatus = "Dodging " .. tostring(boss:GetAttribute("BossAttackKind") or "boss attack")
                         Runtime.Status = Runtime.BossStatus
                     else
+                        -- Rewriting CFrame and punching in the same frame makes the
+                        -- server validate the old position. Hold each tracked
+                        -- position briefly so several attacks land before updating.
                         if os.clock() >= nextTrack then
                             char:PivotTo(Boss.footCFrame(boss, arena, hitbox))
+                            -- Follow the animated foot again immediately after
+                            -- each server-validated punch cycle.
                             nextTrack = os.clock() + 0.35
                             engageReadyAt = os.clock() + 0.25
                         end
@@ -1886,6 +1977,7 @@ local function nextNpcQuest(questLine)
     local catalogQuests = questLine and questLine:FindFirstChild("Quests")
     if not root or not story or not completed or not catalogQuests then return nil end
 
+    -- An NPC only gives another story quest after its current one is collected.
     if story:FindFirstChild(questLine.Name) then return nil end
 
     local finished = completed:FindFirstChild(questLine.Name)
@@ -1904,6 +1996,7 @@ local function nextNpcQuest(questLine)
         end
     end
 
+    -- Industrial Gains unlocks one rotating quest every 24 hours.
     if questLine.Name == "Industrial Gains" then
         local industrial = root:FindFirstChild("Industrial Daily")
         if industrial and #industrial:GetChildren() > 0 then return nil end
@@ -1952,13 +2045,17 @@ end
 
 local function currencyValue(kind)
     if kind == "Tokens" then return Tokens.Value end
-    return Gems.Value
+    if kind == "OverchargedShards" then return OverchargedShards.Value end
+    if kind == "Gems" then return Gems.Value end
+    return nil
 end
 
 local function hatchOnce(name)
     local price, kind = crystalCost(name)
     if not price then return false, "unknown crystal" end
-    if currencyValue(kind) - price < State.KeepCurrency then return false, "saving " .. kind end
+    local balance = currencyValue(kind)
+    if balance == nil then return false, "unknown currency " .. tostring(kind) end
+    if balance - price < State.KeepCurrency then return false, "saving " .. kind end
     local pet, rarity = invoke(Remotes.Crystal, "openCrystal", name)
     if type(pet) == "string" then
         Runtime.Hatched = Runtime.Hatched + 1
@@ -2027,6 +2124,106 @@ local function selectedName(selection, name)
     if selection[name] == true then return true end
     for _, value in pairs(selection) do
         if value == name then return true end
+    end
+    return false
+end
+
+function Enchant.Shop.getState()
+    if not Remotes.OverchargedShop or not Remotes.OverchargedShop:IsA("RemoteFunction") then
+        Runtime.ShopStatus = "Shop remote is unavailable"
+        return nil
+    end
+    local result = invoke(Remotes.OverchargedShop, "GetState")
+    if type(result) == "table" and result.Ok ~= false and type(result.Offers) == "table" then
+        return result
+    end
+    Runtime.ShopStatus = "Could not read the shop"
+    return nil
+end
+
+function Enchant.Shop.options(shopState)
+    local items, seen = {}, {}
+    for _, offer in ipairs(shopState and shopState.Offers or {}) do
+        local name = type(offer) == "table" and offer.ItemName or nil
+        if type(name) == "string" and name ~= "" and not seen[name] then
+            seen[name] = true
+            items[#items + 1] = name
+        end
+    end
+    table.sort(items)
+    local options = {Enchant.Shop.AllItems}
+    for _, name in ipairs(items) do options[#options + 1] = name end
+    return options
+end
+
+function Enchant.Shop.syncOptions(shopState)
+    local options = Enchant.Shop.options(shopState)
+    local valid = {}
+    for _, name in ipairs(options) do
+        if selectedName(State.OverchargedShopItems, name) then valid[name] = true end
+    end
+    State.OverchargedShopItems = valid
+    Runtime.OverchargedShopOptions = options
+    local signature = table.concat(options, "\0")
+    if Runtime.OverchargedShopDropdown and signature ~= Runtime.OverchargedShopOptionsSignature then
+        Runtime.OverchargedShopOptionsSignature = signature
+        Runtime.OverchargedShopUpdating = true
+        pcall(Runtime.OverchargedShopDropdown.UpdateOptions, options, true)
+        pcall(Runtime.OverchargedShopDropdown.SetValue, valid)
+        Runtime.OverchargedShopUpdating = false
+    end
+    return options
+end
+
+function Enchant.Shop.buyPass()
+    local shopState = Enchant.Shop.getState()
+    if not shopState then return false end
+    Enchant.Shop.syncOptions(shopState)
+
+    local buyAll = selectedName(State.OverchargedShopItems, Enchant.Shop.AllItems)
+    local selected, inStock, affordable = false, false, false
+    local lastReason = nil
+    for _, offer in ipairs(shopState.Offers) do
+        local name = type(offer) == "table" and offer.ItemName or nil
+        if type(name) == "string" and (buyAll or selectedName(State.OverchargedShopItems, name)) then
+            selected = true
+            local remaining = tonumber(offer.Remaining) or 0
+            local price = tonumber(offer.ShardPrice) or math.huge
+            if remaining > 0 then
+                inStock = true
+                if OverchargedShards.Value >= price then
+                    affordable = true
+                    local key = tostring(offer.Key or offer.SlotIndex or name)
+                    if os.clock() >= (Runtime.ShopFailures[key] or 0) then
+                        local result = invoke(Remotes.OverchargedShop, "Purchase", {
+                            SlotIndex = offer.SlotIndex,
+                            Key = offer.Key,
+                        })
+                        if type(result) == "table" and result.Ok == true then
+                            local quantity = tonumber(offer.Quantity) or 1
+                            Runtime.ShopBought = Runtime.ShopBought + quantity
+                            Runtime.ShopStatus = ("Bought %dx %s"):format(quantity, name)
+                            Runtime.ShopFailures[key] = nil
+                            return true
+                        end
+                        lastReason = type(result) == "table" and tostring(result.Reason or "denied") or "denied"
+                        Runtime.ShopFailures[key] = os.clock() + (lastReason == "inventoryFull" and 30 or 5)
+                    end
+                end
+            end
+        end
+    end
+
+    if not selected then
+        Runtime.ShopStatus = "Select at least one shop item"
+    elseif not inStock then
+        Runtime.ShopStatus = "Selected items are sold out"
+    elseif not affordable then
+        Runtime.ShopStatus = "Waiting for enough Overcharged Shards"
+    elseif lastReason then
+        Runtime.ShopStatus = "Purchase blocked: " .. lastReason
+    else
+        Runtime.ShopStatus = "Waiting for selected stock"
     end
     return false
 end
@@ -2262,6 +2459,8 @@ local function fuseSelectedPets()
     local selected = State.FusePetNames
     if type(selected) ~= "table" then return 0 end
 
+    -- The craft machine has one server-side timed slot. Query/claim that slot
+    -- with empty inputs; the four input instances only belong to craftPets.
     local current = invoke(Remotes.PetCraft, "getFuse", EMPTY_FUSE_SLOTS)
     if type(current) ~= "table" then
         Runtime.FuseStatus = "Could not read fuse state"
@@ -2316,6 +2515,8 @@ local function fuseSelectedPets()
     end)
 end
 
+-- Kept for callers of the older session API; this now performs the actual
+-- four-pet fusion flow instead of the unrelated five-copy evolve event.
 local function evolveReadyPets(selection)
     local previous = State.FusePetNames
     State.FusePetNames = selection or previous
@@ -2335,6 +2536,31 @@ spawnTask(function()
         if State.AutoWheel and now > nextWheel then nextWheel = now + 60 pcall(spinWheel) end
         if State.AutoQuests and now > nextQuest then nextQuest = now + 10 pcall(updateNpcQuests) end
         task.wait(2)
+    end
+end)
+
+spawnTask(function()
+    local nextRefresh = 0
+    while running() do
+        elevate()
+        if State.AutoBuyOverchargedShop then
+            local bought = Enchant.Shop.buyPass()
+            task.wait(bought and 0.25 or 2)
+        else
+            if os.clock() >= nextRefresh then
+                nextRefresh = os.clock() + 30
+                local shopState = Enchant.Shop.getState()
+                if shopState then
+                    Enchant.Shop.syncOptions(shopState)
+                    Runtime.ShopStatus = "Ready"
+                end
+            end
+            task.wait(1)
+        end
+        if Runtime.OverchargedShopStatusLabel then
+            Runtime.OverchargedShopStatusLabel.SetText(("Shop: %s  |  Bought: %d"):format(
+                Runtime.ShopStatus, Runtime.ShopBought))
+        end
     end
 end)
 
@@ -2650,6 +2876,23 @@ GuiLibrary:CreateToggle(CollectTab, "Auto Get & Collect NPC Quests", State.AutoQ
     if v then spawnTask(updateNpcQuests) end
 end)
 
+GuiLibrary:CreateSection(CollectTab, "Overcharged Shop")
+Runtime.OverchargedShopState = Enchant.Shop.getState()
+Runtime.OverchargedShopOptions = Enchant.Shop.options(Runtime.OverchargedShopState)
+Runtime.OverchargedShopToggle = GuiLibrary:CreateToggle(CollectTab, "Auto Buy Overcharged Shop", State.AutoBuyOverchargedShop, function(v)
+    State.AutoBuyOverchargedShop = v
+    Runtime.ShopStatus = v and "Starting" or "Stopped"
+end)
+Runtime.OverchargedShopUpdating = true
+Runtime.OverchargedShopDropdown = GuiLibrary:CreateMultiSelect(CollectTab, "Overcharged Shop Items", Runtime.OverchargedShopOptions, {}, function(sel)
+    if not Runtime.OverchargedShopUpdating then
+        State.OverchargedShopItems = sel or {}
+    end
+end)
+Runtime.OverchargedShopUpdating = false
+Runtime.OverchargedShopStatusLabel = GuiLibrary:CreateLabel(CollectTab, "Shop: " .. Runtime.ShopStatus .. "  |  Bought: 0")
+if Runtime.OverchargedShopState then Enchant.Shop.syncOptions(Runtime.OverchargedShopState) end
+
 GuiLibrary:CreateSection(CollectTab, "Pet Enchant Quest")
 Runtime.EnchantQuestLabel = GuiLibrary:CreateLabel(CollectTab, "Enchant quest: waiting")
 Runtime.EnchantQuestToggle = GuiLibrary:CreateToggle(CollectTab, "Auto Complete Enchant Quest", State.AutoEnchantQuest, function(v)
@@ -2850,6 +3093,7 @@ GuiLibrary:CreateSection(MiscTab, "Session Control")
 GuiLibrary:CreateButton(MiscTab, "Stop Everything", function()
     State.AutoHatch, State.AutoBoosts, State.AutoUltimates = false, false, false
     State.AutoChests, State.AutoGroup, State.AutoGifts, State.AutoWheel, State.AutoQuests = false, false, false, false, false
+    State.AutoBuyOverchargedShop = false
     State.AutoEnchantQuest = false
     Runtime.EnchantDiscardFarm = true
     State.AutoEquipPets, State.AutoSellPets, State.AutoDeletePets = false, false, false
@@ -3035,7 +3279,10 @@ spawnTask(function()
         if sStrength then sStrength.SetText("Strength: " .. short(Strength.Value)) end
         if sAgility then sAgility.SetText("Agility: " .. short(Agility.Value)) end
         if sDurability then sDurability.SetText("Durability: " .. short(Durability.Value)) end
-        if sCurrency then sCurrency.SetText(("Gems: %s   Tokens: %s"):format(short(Gems.Value), short(Tokens.Value))) end
+        if sCurrency then
+            sCurrency.SetText(("Gems: %s   Tokens: %s   Overcharged Shards: %s"):format(
+                short(Gems.Value), short(Tokens.Value), short(OverchargedShards.Value)))
+        end
         if sRebirths then sRebirths.SetText("Rebirths: " .. short(Rebirths.Value)) end
         if sRate then
             sRate.SetText(("Gains/min  Str %s  Agi %s  Dur %s"):format(
@@ -3063,7 +3310,8 @@ SESSION.api = {
     generationAlive = generationAlive,
     ui = {farmMode = farmModeDropdown, farmMethod = sourceMethodDropdown, farmAreas = farmAreaDropdown,
         machine = machineDropdown, tool = toolDropdown, fusePets = petFuseDropdown,
-        enchantQuest = Runtime.EnchantQuestToggle, enchantEvolve = Runtime.EnchantEvolveToggle},
+        enchantQuest = Runtime.EnchantQuestToggle, enchantEvolve = Runtime.EnchantEvolveToggle,
+        overchargedShop = Runtime.OverchargedShopToggle, overchargedShopItems = Runtime.OverchargedShopDropdown},
     candidateSources = candidateSources,
     teleportToKingsGym = teleportToKingsGym,
     machineSources = machineSources,
@@ -3082,7 +3330,10 @@ SESSION.api = {
     findActiveBoss = Boss.findActive,
     killBoss = Boss.kill,
     travelToArea = travelToArea,
+    findArea = function(id) return AREA_BY_ID[id] end,
     hatchOnce = hatchOnce,
+    getOverchargedShopState = Enchant.Shop.getState,
+    buyOverchargedShopPass = Enchant.Shop.buyPass,
     rebirthChain = rebirthChain,
 }
 
